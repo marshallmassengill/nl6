@@ -45,6 +45,7 @@ var netconfServerCapabilities = func() []string {
 		"urn:ietf:params:netconf:base:1.0",
 		"urn:ietf:params:netconf:base:1.1",
 		"urn:ietf:params:netconf:capability:interleave:1.0",
+		"urn:ietf:params:netconf:capability:notification:1.0",
 		"urn:ietf:params:netconf:capability:yang-library:1.1?revision=2019-01-04&content-id=" + netconfLibraryContentID,
 	}
 	for _, m := range netconfModules {
@@ -128,8 +129,30 @@ type netconfSession struct {
 	subsMu sync.Mutex
 	subs   map[uint32]*netconfSubscription
 
+	// user and source identify the session in RFC 6470 session events: the
+	// client certificate's common name, and the peer address.
+	user, source string
+	helloDone    bool // the session-start was recorded, so an end is owed
+
+	// endReason and killedBy describe how the session ended, for its
+	// netconf-session-end. Written before close runs, read inside it.
+	endMu     sync.Mutex
+	endReason string
+	killedBy  uint32
+
 	done      chan struct{}
 	closeOnce sync.Once
+}
+
+// closeWith records why the session ends and closes it. The first reason
+// wins: a kill-session racing a read error still reports killed.
+func (s *netconfSession) closeWith(reason string, killedBy uint32) {
+	s.endMu.Lock()
+	if s.endReason == "" {
+		s.endReason, s.killedBy = reason, killedBy
+	}
+	s.endMu.Unlock()
+	s.close()
 }
 
 // run serves the session until the connection ends. A panic while serving
@@ -148,6 +171,8 @@ func (s *netconfSession) run() {
 		s.srv.mgr.netconf.logFirstHelloError(s.srv.dev, err)
 		return
 	}
+	s.helloDone = true
+	s.srv.events.sessionEvent(netconfEvent{kind: netconfEventSessionStart, sessionID: s.id, user: s.user, source: s.source})
 	for {
 		msg, err := s.rd.ReadMessage()
 		if err != nil {
@@ -262,6 +287,16 @@ func (s *netconfSession) close() {
 			sub.stop()
 		}
 		s.srv.removeSession(s)
+		if s.helloDone {
+			s.endMu.Lock()
+			reason, killer := s.endReason, s.killedBy
+			s.endMu.Unlock()
+			if reason == "" {
+				reason = "dropped"
+			}
+			s.srv.events.sessionEvent(netconfEvent{kind: netconfEventSessionEnd, sessionID: s.id,
+				user: s.user, source: s.source, reason: reason, killedBy: killer})
+		}
 	})
 }
 
@@ -296,6 +331,9 @@ func (s *netconfSession) handle(msg []byte) bool {
 	}
 	if res.after != nil {
 		res.after()
+	}
+	if res.close {
+		s.closeWith("closed", 0)
 	}
 	return !res.close
 }
@@ -357,6 +395,10 @@ func (s *netconfSession) dispatch(op *xmlElem) netconfRPCResult {
 		if op.Local == "get-data" {
 			return s.opGetData(op)
 		}
+	case nsNetconfMonitoring:
+		if op.Local == "get-schema" {
+			return s.opGetSchema(op)
+		}
 	case nsSubscribedNotif:
 		switch op.Local {
 		case "establish-subscription":
@@ -366,8 +408,7 @@ func (s *netconfSession) dispatch(op *xmlElem) netconfRPCResult {
 		}
 	case nsNetconfNotif:
 		if op.Local == "create-subscription" {
-			return netconfRPCResult{err: netconfErr("protocol", "operation-not-supported",
-				"nl6 publishes no RFC 5277 event streams; use RFC 8639 establish-subscription on a datastore (RFC 8641)")}
+			return s.opCreateSubscription(op)
 		}
 	}
 	return netconfRPCResult{err: netconfErr("protocol", "operation-not-supported", "operation %s (%s) is not supported", op.Local, op.Space)}
@@ -551,6 +592,6 @@ func (s *netconfSession) opKillSession(op *xmlElem) netconfRPCResult {
 	if victim == nil {
 		return netconfRPCResult{err: netconfErr("protocol", "invalid-value", "no session %d", id)}
 	}
-	victim.close()
+	victim.closeWith("killed", s.id)
 	return netconfOK
 }

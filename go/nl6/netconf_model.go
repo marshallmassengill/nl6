@@ -46,8 +46,20 @@ var netconfModules = []netconfModule{
 	{Name: "ietf-datastores", Revision: "2018-02-14", Namespace: nsDatastores},
 	{Name: "ietf-netconf", Revision: "2011-06-01", Namespace: nsNetconfBase, YANG10: true},
 	{Name: "ietf-netconf-nmda", Revision: "2019-01-07", Namespace: nsNetconfNMDA},
-	{Name: "ietf-subscribed-notifications", Revision: "2019-09-09", Namespace: nsSubscribedNotif, Features: []string{"encode-xml", "subtree", "xpath"}},
+	{Name: "ietf-subscribed-notifications", Revision: "2019-09-09", Namespace: nsSubscribedNotif, Features: []string{"encode-xml", "replay", "subtree", "xpath"}},
 	{Name: "ietf-yang-push", Revision: "2019-09-09", Namespace: nsYangPush, Features: []string{"on-change"}},
+	{Name: "ietf-alarms", Revision: "2019-09-11", Namespace: nsAlarms},
+	{Name: "nl6-alarm-types", Revision: "2026-10-26", Namespace: nsNl6AlarmTypes},
+	{Name: "ietf-netconf-notifications", Revision: "2012-02-06", Namespace: nsNetconfNotifications, YANG10: true},
+	{Name: "ietf-netconf-monitoring", Revision: "2010-10-04", Namespace: nsNetconfMonitoring, YANG10: true},
+	// RFC 5277's create-subscription, replayComplete, notificationComplete and
+	// /netconf/streams, in CESNET's YANG rendering of the RFC's XSD. Listing
+	// them is also what keeps libnetconf2 clients alive: one that sees
+	// :notification:1.0 without them appends the two to its module array
+	// without terminating it, and crashes (libnetconf2 v3.7.1,
+	// build_module_info_yl).
+	{Name: "notifications", Revision: "2008-07-14", Namespace: nsNetconfNotif, YANG10: true},
+	{Name: "nc-notifications", Revision: "2008-07-14", Namespace: nsNetmodNotification, YANG10: true},
 	{Name: "ietf-yang-types", Revision: "2013-07-15", Namespace: "urn:ietf:params:xml:ns:yang:ietf-yang-types", ImportOnly: true},
 	{Name: "ietf-inet-types", Revision: "2013-07-15", Namespace: "urn:ietf:params:xml:ns:yang:ietf-inet-types", ImportOnly: true},
 	{Name: "ietf-netconf-acm", Revision: "2018-02-14", Namespace: "urn:ietf:params:xml:ns:yang:ietf-netconf-acm", ImportOnly: true},
@@ -63,7 +75,7 @@ var netconfModules = []netconfModule{
 
 // netconfLibraryContentID identifies the schema above. It changes only
 // when netconfModules does, so bump it with any edit to that table.
-const netconfLibraryContentID = "nl6-netconf-1"
+const netconfLibraryContentID = "nl6-netconf-3"
 
 // netconfModuleNamespace returns the namespace of a served module, or "".
 func netconfModuleNamespace(name string) string {

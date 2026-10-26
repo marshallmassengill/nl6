@@ -37,7 +37,7 @@ sudo ./nl6 [flags]
 -if-error-scenario <s>  # Auto-start-batch per-device error/discard scenario: clean (default) | typical | degraded | failing. REST-created devices default to clean; opt in via if_error_scenario.
 -if-flap-scenario <s>   # [seed]   Auto-start-batch per-device link-flap scenario: clean (default; no flaps) | rare (~6h mean) | typical (~15min) | aggressive (~1min). REST-created devices default to clean; opt in via if_flap_scenario.
 -if-flap-global-cap <r> # [global] Simulator-wide tps ceiling on flap events (0 = unlimited)
--netconf-enable         # [global] NETCONF over TLS (RFC 7589) + YANG-Push (RFC 8639/8641), ietf-interfaces, OFF by default. docs/reference/netconf.md; READ context/netconf.md first. make test-interop-netconf (yanglint + netopeer2-cli) is the external check.
+-netconf-enable         # [global] NETCONF over TLS (RFC 7589), OFF by default: YANG-Push (RFC 8639/8641) on ietf-interfaces, NETCONF stream (ietf-alarms link-down, RFC 6470 session events, replay; RFC 8639 + 5277), get-schema over embedded go/nl6/netconf_yang. docs/reference/netconf.md; READ context/netconf.md first. make test-interop-netconf (yanglint + netopeer2-cli) is the external check.
 -netconf-port / -netconf-tls-cert / -netconf-tls-key / -netconf-tls-client-ca  # [global] 6513; server cert (default shared self-signed, new per start); client CA (empty = cert REQUIRED but not verified)
 -gnmi-port <port>       # TCP port for gNMI listener on each device (default: 9339)
 -gnmi-disable           # Disable the gNMI subsystem; no device listens on the gNMI port (default: false, subsystem on)

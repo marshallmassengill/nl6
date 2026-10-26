@@ -14,6 +14,9 @@ The user-facing reference is `docs/reference/netconf.md`. This file records the 
 | `netconf_subscription.go` | RFC 8639/8641 dynamic subscriptions: periodic, on-change, dampening, stop-time. |
 | `netconf_server.go` | Per-device TLS listener in the netns, session table, running lock, datastore view. |
 | `netconf_manager.go` | Subsystem config, TLS config, counters, `GET /api/v1/netconf/status`. |
+| `netconf_events.go` | The per-device `NETCONF` stream: event log and replay ring, link alarm list, `/alarms`, `/streams`, `/netconf/streams`. |
+| `netconf_schema.go` | `get-schema` (RFC 6022) and `/netconf-state/schemas` over the embedded modules. |
+| `netconf_yang/` | Every library module, embedded; `SOURCES.tsv` holds provenance and digests. |
 
 The subsystem is OFF by default (`-netconf-enable`). It is wired into `DeviceSimulator.Start`, `Stop`, `stopListenersOnly` and the Start error cleanup, and into `SimulatorManager.Shutdown` through `StopNetconfSubsystem`.
 
@@ -23,7 +26,11 @@ The subsystem is OFF by default (`-netconf-enable`). It is wired into `DeviceSim
 
 **XPath is a subset, translated into a subtree filter.** Both filter types run through one engine and cannot disagree. Anything outside the subset is refused with an error naming the subset, never evaluated approximately. nl6 does NOT advertise `:xpath` or `ietf-netconf:xpath`. The sn `xpath` feature IS advertised, because `datastore-xpath-filter` is how collectors select YANG-Push data. A strict client (netopeer2-cli) therefore refuses to send `get-data` with an `xpath-filter`, which is correct.
 
-**No event streams.** A stream subscription is refused with `stream-unavailable` rather than accepted and left silent; that would be the accepted-echoed-ignored family (nl6#445). `create-subscription` is refused for the same reason.
+**One event stream, `NETCONF`, recorded whether or not anyone listens.** The event log hangs off `InterfaceState.AddObserver`, a SYNCHRONOUS hook in `Broadcast`: a listener channel would need a goroutine per device to drain it, and 30k idle goroutines is the wrong price for a log nobody may read. Observers run on the mutating goroutine, so they must not block; stream subscriptions take records through `deliver`, which drops the oldest record rather than waiting. `onState` re-reads `Snapshot` instead of trusting the event's fields, so two mutators broadcasting out of order still leave the alarm matching the state. Any other stream name is refused with `stream-unavailable`, never accepted and left silent (nl6#445).
+
+**The link alarm rule is admin up AND oper down.** Admin down is a deliberate shutdown, not a fault, and lower-layer-down is the parent's alarm showing through. A cleared alarm STAYS in the list with `is-cleared true`: RFC 8632 leaves purging to the operator, and dropping it would make a collector's `reconcile` see an alarm vanish without a clear. Alarms already active at device start are seeded into the list, dated from their last change, and are not notified.
+
+**`nl6-alarm-types` exists because RFC 8632 defines no concrete alarm types.** Its namespace is under the project's docs site, a URI the project controls, rather than an unregistered URN. Changing the file means updating its digest in `SOURCES.tsv`, which the provenance test enforces.
 
 **A period below 1 s is refused (`period-unsupported`), not clamped.** gNMI clamps silently; NETCONF has an error identity for this, so it uses it.
 
@@ -39,6 +46,10 @@ Every item below passed the in-package tests and failed against libyang or libne
 4. **The `ietf-netconf` revision.** nl6 advertises RFC 6241's `2011-06-01`. The notconf image ships libnetconf2's `2013-09-29` variant, so the Makefile fetches the RFC module at the pinned `CISCO_YANG_COMMIT` and checks its sha256.
 5. **libnetconf2 matches the dialled host against DNS SANs only**, so the interop server certificate carries `127.0.0.1` as a DNS name too. This is a test-fixture fact, not a server change. It is also why the docs tell operators to supply their own certificate.
 
+6. **libnetconf2 v3.7.1 crashes on `:notification:1.0` without the RFC 5277 modules.** When the library lists neither `notifications` nor `nc-notifications`, `build_module_info_yl` reallocs its module array, appends both, and never writes the terminating entry, so the next lookup walks into uninitialised memory (found with gdb; backtrace in `retrieve_module_data_imp`). Netopeer2 always lists them, so the path is otherwise unreached. nl6 lists them too: they are CESNET's YANG renderings of RFC 5277's XSD, embedded from CESNET/netopeer2 at a pinned commit. Do not drop them as "not IETF".
+7. **CESNET's `notifications` module has a top-level `container notification` with a mandatory `eventTime`**, an internal struct of theirs, so no real datastore validates as "complete" with it implemented. The interop check therefore runs yanglint with `-e`, which checks only the modules whose data is present, and `TestNetconfOperationalServesEveryStateTree` asserts the presence that `-e` stops checking.
+8. **netopeer2-cli resolves what it lacks through `get-schema`.** The interop session gives it NO search path: before `get-schema` existed it needed nl6's `ietf-netconf@2011-06-01` mounted, and now it fetches that, `ietf-alarms` and `nl6-alarm-types` from the device. A failed `get-schema` would surface as an rpc-error, which the session asserts is zero.
+
 ## Mistakes that are easy to reintroduce
 
 - **`strings.Builder` in a growing slice.** `parseNetconfXML` keeps one text builder per open element. Storing them by VALUE made `append` copy a written builder, and the next write panicked. That reached a session goroutine, which nothing recovers, so one RPC with text ahead of a child element killed the whole simulator. The fuzzer found it (`FuzzNetconfRequest`, crasher kept in `testdata/fuzz`). The builders are pointers now, and `session.run` and `subscription.run` recover, so a future parser bug closes one session.
@@ -47,6 +58,8 @@ Every item below passed the in-package tests and failed against libyang or libne
 - **Changing framing anywhere but the hello.** Reading chunked bytes as end-of-message, or the reverse, does not fail; it waits for a delimiter that never comes. `chunked` is set once, in `hello`, before any other goroutine can write.
 - **Admin and the derived oper are TWO engine events.** `ApplyAdminStatus` broadcasts the admin move and the oper move separately, so an admin-down produces two `push-change-update`s. That is correct; a test that expects one is wrong.
 - **`enabled` is derived from admin-status and the event carries only the new admin**, so each on-change subscription keeps the last `enabled` it reported per interface.
+- **Replay and live must be registered under one lock.** `netconfEventLog.subscribe` adds the subscription and snapshots the ring in the same critical section, so no record falls between replay and live and none is sent twice. Snapshot-then-register loses records under load.
+- **A test that renames an interface must do it before the server starts.** The event log builds the interface view when the device's server starts; `startTestNetconfWith`'s prep hook exists for this.
 
 ## Interop test detection power
 

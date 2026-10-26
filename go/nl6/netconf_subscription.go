@@ -14,10 +14,10 @@ import (
 	"time"
 )
 
-// Dynamic YANG-Push subscriptions (RFC 8639 establish-subscription carrying
-// the RFC 8641 datastore augmentations). nl6 publishes no event streams, so a
-// stream subscription is refused with stream-unavailable rather than
-// accepted and left silent.
+// Dynamic subscriptions: RFC 8639 establish-subscription to the NETCONF
+// event stream or, with the RFC 8641 augmentations, to a datastore, plus
+// RFC 5277 create-subscription to the stream. Stream records come from the
+// device's event log (netconf_events.go), replay included.
 //
 // On-change reports what the interface state engine moves: admin-status,
 // oper-status, enabled and last-change. Statistics change continuously and
@@ -61,6 +61,15 @@ type netconfSubscription struct {
 
 	stopTime time.Time // zero when absent
 
+	// Event-stream subscriptions (stream true). rfc5277 marks one made by
+	// create-subscription, which ends with notificationComplete and has no
+	// id the client can name. replay is set when a start time was given.
+	stream     bool
+	rfc5277    bool
+	replay     bool
+	replayFrom time.Time
+	records    chan netconfEvent
+
 	mu      sync.Mutex // guards stopped and the listener registration
 	stopped bool
 	events  chan StateChange
@@ -90,10 +99,33 @@ func (s *netconfSession) opEstablishSubscription(op *xmlElem) netconfRPCResult {
 	var haveTrigger bool
 	for _, c := range op.Children {
 		switch {
-		case c.Space == nsSubscribedNotif && (c.Local == "stream" || c.Local == "stream-subtree-filter" ||
-			c.Local == "stream-xpath-filter" || c.Local == "stream-filter-name" || c.Local == "replay-start-time"):
-			return netconfSubError("ietf-subscribed-notifications:stream-unavailable",
-				"nl6 publishes no event streams; subscribe to a datastore (RFC 8641)")
+		case c.Space == nsSubscribedNotif && c.Local == "stream":
+			if c.Text != netconfStreamName {
+				return netconfSubError("ietf-subscribed-notifications:stream-unavailable",
+					"nl6 publishes one event stream, %s, not %q", netconfStreamName, c.Text)
+			}
+			sub.stream = true
+		case c.Space == nsSubscribedNotif && c.Local == "stream-subtree-filter":
+			sub.filter, sub.filtered = subtreeFilterFromXML(c.Children), true
+		case c.Space == nsSubscribedNotif && c.Local == "stream-xpath-filter":
+			nodes, err := xpathToSubtreeFilter(c.Text, c.Scope)
+			if err != nil {
+				return netconfSubError("ietf-subscribed-notifications:filter-unsupported", "%v", err)
+			}
+			sub.filter, sub.filtered = nodes, true
+		case c.Space == nsSubscribedNotif && c.Local == "stream-filter-name":
+			return netconfSubError("ietf-subscribed-notifications:filter-unavailable",
+				"nl6 has no configured stream filters to reference")
+		case c.Space == nsSubscribedNotif && c.Local == "replay-start-time":
+			t, err := time.Parse(time.RFC3339Nano, c.Text)
+			if err != nil {
+				return netconfRPCResult{err: netconfErr("application", "invalid-value", "replay-start-time %q is not a date-and-time", c.Text)}
+			}
+			if t.After(time.Now()) {
+				return netconfSubError("ietf-subscribed-notifications:replay-unsupported",
+					"replay-start-time %s is in the future", c.Text)
+			}
+			sub.replay, sub.replayFrom = true, t
 		case c.Space == nsSubscribedNotif && c.Local == "stop-time":
 			t, err := time.Parse(time.RFC3339Nano, c.Text)
 			if err != nil {
@@ -140,37 +172,65 @@ func (s *netconfSession) opEstablishSubscription(op *xmlElem) netconfRPCResult {
 			return netconfRPCResult{err: netconfUnknownElement(c)}
 		}
 	}
-	if sub.datastore == "" {
-		e := netconfErr("application", "missing-element", "establish-subscription needs a datastore (nl6 publishes no event streams)")
-		e.Info = netconfBadElement("datastore")
+	switch {
+	case sub.stream && sub.datastore != "":
+		return netconfRPCResult{err: netconfErr("application", "invalid-value", "a subscription targets a stream or a datastore, not both")}
+	case sub.stream && haveTrigger:
+		return netconfRPCResult{err: netconfErr("application", "invalid-value", "periodic and on-change apply to datastore subscriptions only")}
+	case !sub.stream && sub.replay:
+		return netconfRPCResult{err: netconfErr("application", "invalid-value", "replay-start-time applies to stream subscriptions only")}
+	case !sub.stream && sub.datastore == "":
+		e := netconfErr("application", "missing-element", "establish-subscription needs a stream or a datastore")
+		e.Info = netconfBadElement("target")
 		return netconfRPCResult{err: e}
-	}
-	if !haveTrigger {
+	case !sub.stream && !haveTrigger:
 		e := netconfErr("application", "missing-element", "a datastore subscription needs periodic or on-change")
 		e.Info = netconfBadElement("update-trigger")
 		return netconfRPCResult{err: e}
 	}
+	// RFC 8639 §2.4.2.1: a start time older than the buffer reaches back is
+	// revised to what the buffer holds, and the reply says so.
+	var revision string
+	if sub.replay {
+		if floor := s.srv.events.replayFloor(); sub.replayFrom.Before(floor) {
+			sub.replayFrom = floor
+			revision = `<replay-start-time-revision xmlns="` + nsSubscribedNotif + `">` + netconfDateTime(floor) + `</replay-start-time-revision>`
+		}
+	}
+	if rerr := s.addSubscription(sub); rerr != nil {
+		return netconfRPCResult{err: rerr}
+	}
+	return netconfRPCResult{
+		body:  `<id xmlns="` + nsSubscribedNotif + `">` + strconv.FormatUint(uint64(sub.id), 10) + `</id>` + revision,
+		after: sub.start, // after the reply, so the id is known before any update
+	}
+}
+
+// addSubscription registers sub on the session under the per-session cap.
+func (s *netconfSession) addSubscription(sub *netconfSubscription) *netconfRPCError {
 
 	s.subsMu.Lock()
+	defer s.subsMu.Unlock()
 	if s.subs == nil { // the session closed under us
-		s.subsMu.Unlock()
-		return netconfRPCResult{err: netconfErr("application", "operation-failed", "session is closing")}
+		return netconfErr("application", "operation-failed", "session is closing")
 	}
 	if len(s.subs) >= netconfMaxSubscriptionsPerSession {
-		s.subsMu.Unlock()
-		return netconfSubError("ietf-subscribed-notifications:insufficient-resources",
-			"a session carries at most %d subscriptions", netconfMaxSubscriptionsPerSession)
+		e := netconfErr("application", "invalid-value", "a session carries at most %d subscriptions", netconfMaxSubscriptionsPerSession)
+		e.AppTag = "ietf-subscribed-notifications:insufficient-resources"
+		return e
+	}
+	if sub.rfc5277 {
+		for _, other := range s.subs {
+			if other.rfc5277 {
+				return netconfErr("protocol", "operation-failed", "RFC 5277 allows one create-subscription per session; this session has one")
+			}
+		}
 	}
 	sub.id = s.srv.mgr.netconf.nextSubscriptionID.Add(1)
 	sub.quit = make(chan struct{})
 	s.subs[sub.id] = sub
-	s.subsMu.Unlock()
 	s.srv.mgr.netconf.subscriptionsActive.Add(1)
-
-	return netconfRPCResult{
-		body:  `<id xmlns="` + nsSubscribedNotif + `">` + strconv.FormatUint(uint64(sub.id), 10) + `</id>`,
-		after: sub.start, // after the reply, so the id is known before any update
-	}
+	return nil
 }
 
 func (sub *netconfSubscription) parsePeriodic(c *xmlElem) *netconfRPCError {
@@ -246,6 +306,9 @@ func (s *netconfSession) opDeleteSubscription(op *xmlElem) netconfRPCResult {
 	id, err := strconv.ParseUint(idEl.Text, 10, 32)
 	s.subsMu.Lock()
 	sub := s.subs[uint32(id)]
+	if sub != nil && sub.rfc5277 {
+		sub = nil // RFC 5277 subscriptions have no id a client can name
+	}
 	if err == nil && sub != nil {
 		delete(s.subs, sub.id)
 	}
@@ -268,6 +331,12 @@ func (sub *netconfSubscription) start() {
 	if sub.stopped {
 		return
 	}
+	if sub.stream {
+		sub.records = make(chan netconfEvent, netconfStreamBuffer)
+		replayed := sub.sess.srv.events.subscribe(sub, sub.replayFrom)
+		go sub.runStream(replayed)
+		return
+	}
 	if !sub.periodic {
 		if ic := sub.sess.srv.ifCounters(); ic != nil && ic.State() != nil {
 			sub.events = make(chan StateChange, netconfOnChangeBuffer)
@@ -288,6 +357,9 @@ func (sub *netconfSubscription) stop() {
 	}
 	sub.stopped = true
 	close(sub.quit)
+	if sub.stream {
+		sub.sess.srv.events.unsubscribe(sub)
+	}
 	if sub.state != nil {
 		sub.state.RemoveListener(sub.events)
 	}
@@ -310,6 +382,10 @@ func (sub *netconfSubscription) complete() {
 		return
 	}
 	sub.stop()
+	if sub.rfc5277 {
+		_ = s.sendNotification(time.Now(), `<notificationComplete xmlns="`+nsNetmodNotification+`"/>`)
+		return
+	}
 	_ = s.sendNotification(time.Now(), `<subscription-terminated xmlns="`+nsSubscribedNotif+`" xmlns:sn="`+nsSubscribedNotif+
 		`"><id>`+strconv.FormatUint(uint64(sub.id), 10)+`</id><reason>sn:no-such-subscription</reason></subscription-terminated>`)
 }
@@ -565,4 +641,150 @@ func restconfKeyEscape(v string) string {
 		b.WriteByte(hex[c&0x0f])
 	}
 	return b.String()
+}
+
+// deliver queues a stream record without blocking: it runs under the event
+// log's lock, on the goroutine that mutated the interface. A full queue
+// drops its oldest record, like the state engine's listener channels.
+func (sub *netconfSubscription) deliver(ev netconfEvent) {
+	select {
+	case sub.records <- ev:
+		return
+	default:
+	}
+	select {
+	case <-sub.records:
+		sub.sess.srv.mgr.netconf.streamRecordsDropped.Add(1)
+	default:
+	}
+	select {
+	case sub.records <- ev:
+	default:
+		sub.sess.srv.mgr.netconf.streamRecordsDropped.Add(1)
+	}
+}
+
+// runStream sends the replayed records, the end-of-replay marker when a
+// start time was given, and then live records until the subscription ends.
+func (sub *netconfSubscription) runStream(replayed []netconfEvent) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("netconf: subscription %d: recovered from panic: %v; closing its session", sub.id, r)
+			sub.sess.close()
+		}
+	}()
+	var stopC <-chan time.Time
+	if !sub.stopTime.IsZero() {
+		t := time.NewTimer(time.Until(sub.stopTime))
+		defer t.Stop()
+		stopC = t.C
+	}
+	for _, ev := range replayed {
+		if !sub.stopTime.IsZero() && ev.at.After(sub.stopTime) {
+			break
+		}
+		if sub.sendEvent(ev) != nil {
+			return
+		}
+	}
+	if sub.replay {
+		marker := `<replay-completed xmlns="` + nsSubscribedNotif + `"><id>` + strconv.FormatUint(uint64(sub.id), 10) + `</id></replay-completed>`
+		if sub.rfc5277 {
+			marker = `<replayComplete xmlns="` + nsNetmodNotification + `"/>`
+		}
+		if sub.sess.sendNotification(time.Now(), marker) != nil {
+			return
+		}
+	}
+	for {
+		select {
+		case <-sub.quit:
+			return
+		case <-sub.sess.done:
+			return
+		case <-stopC:
+			sub.complete()
+			return
+		case ev := <-sub.records:
+			if sub.sendEvent(ev) != nil {
+				return
+			}
+		}
+	}
+}
+
+// sendEvent renders a record, applies the subscription's filter to the
+// notification content, and sends what is left.
+func (sub *netconfSubscription) sendEvent(ev netconfEvent) error {
+	content := sub.sess.srv.events.render(ev)
+	if content == nil {
+		return nil
+	}
+	nodes := applyNetconfFilter([]*ncNode{content}, sub.filter, sub.filtered)
+	if len(nodes) == 0 {
+		return nil
+	}
+	var b bytes.Buffer
+	writeNetconfNodes(&b, nodes, nsNetconfNotif)
+	if err := sub.sess.sendNotification(ev.at, b.String()); err != nil {
+		return err
+	}
+	sub.sess.srv.mgr.netconf.eventNotifications.Add(1)
+	return nil
+}
+
+// opCreateSubscription is RFC 5277 §2.1.1. One per session; it ends with
+// the session, or at stopTime with notificationComplete.
+func (s *netconfSession) opCreateSubscription(op *xmlElem) netconfRPCResult {
+	sub := &netconfSubscription{sess: s, stream: true, rfc5277: true}
+	var stopGiven bool
+	for _, c := range op.Children {
+		if c.Space != nsNetconfNotif {
+			return netconfRPCResult{err: netconfUnknownElement(c)}
+		}
+		switch c.Local {
+		case "stream":
+			if c.Text != netconfStreamName {
+				return netconfRPCResult{err: netconfErr("protocol", "invalid-value", "nl6 publishes one event stream, %s, not %q", netconfStreamName, c.Text)}
+			}
+		case "filter":
+			filter, filtered, rerr := netconfFilterFrom(c)
+			if rerr != nil {
+				return netconfRPCResult{err: rerr}
+			}
+			sub.filter, sub.filtered = filter, filtered
+		case "startTime":
+			t, err := time.Parse(time.RFC3339Nano, c.Text)
+			if err != nil || t.After(time.Now()) {
+				e := netconfErr("protocol", "bad-element", "startTime %q is not a date-and-time in the past", c.Text)
+				e.Info = netconfBadElement("startTime")
+				return netconfRPCResult{err: e}
+			}
+			sub.replay, sub.replayFrom = true, t
+		case "stopTime":
+			t, err := time.Parse(time.RFC3339Nano, c.Text)
+			if err != nil {
+				e := netconfErr("protocol", "bad-element", "stopTime %q is not a date-and-time", c.Text)
+				e.Info = netconfBadElement("stopTime")
+				return netconfRPCResult{err: e}
+			}
+			sub.stopTime, stopGiven = t, true
+		default:
+			return netconfRPCResult{err: netconfUnknownElement(c)}
+		}
+	}
+	if stopGiven && !sub.replay {
+		e := netconfErr("protocol", "missing-element", "stopTime must be used with startTime (RFC 5277 §2.1.1)")
+		e.Info = netconfBadElement("startTime")
+		return netconfRPCResult{err: e}
+	}
+	if stopGiven && sub.stopTime.Before(sub.replayFrom) {
+		e := netconfErr("protocol", "bad-element", "stopTime is earlier than startTime")
+		e.Info = netconfBadElement("stopTime")
+		return netconfRPCResult{err: e}
+	}
+	if rerr := s.addSubscription(sub); rerr != nil {
+		return netconfRPCResult{err: rerr}
+	}
+	return netconfRPCResult{body: "<ok/>", after: sub.start}
 }

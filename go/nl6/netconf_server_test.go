@@ -253,8 +253,9 @@ func TestNetconfGetConfigServesOnlyConfigNodes(t *testing.T) {
 
 func TestNetconfOnChangePushesEditsForStateTransitions(t *testing.T) {
 	pki := newTestPKI(t, "collector")
-	mgr, dev, addr := startTestNetconf(t, 2, NetconfSubsystemConfig{})
-	dev.resources.oidIndex.Store(".1.3.6.1.2.1.2.2.1.2.1", "Gi0/1") // a name that needs percent-encoding
+	mgr, dev, addr := startTestNetconfWith(t, 2, NetconfSubsystemConfig{}, func(d *DeviceSimulator) {
+		d.resources.oidIndex.Store(".1.3.6.1.2.1.2.2.1.2.1", "Gi0/1") // a name that needs percent-encoding
+	})
 	setLink(t, dev, 1, OperUp)
 	c := mustDialTestNetconf(t, addr, &pki.client)
 
@@ -378,8 +379,13 @@ func TestNetconfEstablishSubscriptionRefusals(t *testing.T) {
 		name, op, tag, appTag string
 	}{
 		{"period below the floor", fmt.Sprintf(establishPeriodic, "", 50), "invalid-value", "ietf-yang-push:period-unsupported"},
-		{"event stream", `<establish-subscription xmlns="` + nsSubscribedNotif + `"><stream>NETCONF</stream></establish-subscription>`,
+		{"unknown event stream", `<establish-subscription xmlns="` + nsSubscribedNotif + `"><stream>SYSLOG</stream></establish-subscription>`,
 			"invalid-value", "ietf-subscribed-notifications:stream-unavailable"},
+		{"stream and datastore", strings.Replace(fmt.Sprintf(establishOnChange, "", ""), "<yp:datastore>",
+			"<stream>NETCONF</stream><yp:datastore>", 1), "invalid-value", ""},
+		{"replay in the future", `<establish-subscription xmlns="` + nsSubscribedNotif + `"><stream>NETCONF</stream>` +
+			`<replay-start-time>2999-01-01T00:00:00Z</replay-start-time></establish-subscription>`,
+			"invalid-value", "ietf-subscribed-notifications:replay-unsupported"},
 		{"unserved datastore", strings.Replace(fmt.Sprintf(establishOnChange, "", ""), "ds:operational", "ds:candidate", 1),
 			"invalid-value", "ietf-yang-push:datastore-not-subscribable"},
 		{"json encoding", strings.Replace(fmt.Sprintf(establishOnChange, "", ""), "<yp:on-change>",
@@ -483,8 +489,6 @@ func TestNetconfProtocolErrorsAndBaseOperations(t *testing.T) {
 	}
 
 	reply, raw := c.rpc(`<edit-config><target><running/></target></edit-config>`)
-	mustRPCError(t, reply, raw, "operation-not-supported", "")
-	reply, raw = c.rpc(`<create-subscription xmlns="` + nsNetconfNotif + `"/>`)
 	mustRPCError(t, reply, raw, "operation-not-supported", "")
 
 	reply, raw = c.rpc(`<lock><target><running/></target></lock>`)

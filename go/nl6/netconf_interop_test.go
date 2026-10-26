@@ -33,9 +33,11 @@ import (
 //     listener with mutual TLS: get-data, then an on-change establish-push
 //     that must deliver the link flap the test causes.
 //
-// Run through `make test-interop-netconf`, which supplies the image and the
-// RFC 6241 ietf-netconf module the image lacks (it ships libnetconf2's
-// 2013-09-29 variant; nl6 advertises the published 2011-06-01).
+// Run through `make test-interop-netconf`. yanglint searches nl6's own
+// embedded modules (netconf_yang/) and nothing else, so it checks exactly
+// what get-schema serves; netopeer2-cli gets no search path and has to fetch
+// what it lacks (ietf-alarms, nl6-alarm-types, the RFC 6241 ietf-netconf)
+// through get-schema.
 func TestNetconfInterop(t *testing.T) {
 	if os.Getenv("NL6_NETCONF_INTEROP") != "1" {
 		t.Skip("set NL6_NETCONF_INTEROP=1 (make test-interop-netconf) to run against libyang and netopeer2-cli")
@@ -44,9 +46,9 @@ func TestNetconfInterop(t *testing.T) {
 	if image == "" {
 		image = "ghcr.io/notconf/notconf:debug"
 	}
-	yangDir := os.Getenv("NL6_NETCONF_YANG_DIR")
-	if _, err := os.Stat(filepath.Join(yangDir, "ietf-netconf@2011-06-01.yang")); err != nil {
-		t.Fatalf("NL6_NETCONF_YANG_DIR must hold ietf-netconf@2011-06-01.yang: %v", err)
+	yangDir, err := filepath.Abs("netconf_yang")
+	if err != nil {
+		t.Fatal(err)
 	}
 	work := t.TempDir()
 	write := func(name, content string) {
@@ -72,7 +74,7 @@ func TestNetconfInterop(t *testing.T) {
 
 	// Every check runs in one container, so the cost is one start.
 	var script strings.Builder
-	script.WriteString("set -e\nY='yanglint -Y /w/library.xml -p /x -p /etc/sysrepo/yang -p /usr/local/share/yang/modules/libyang'\n")
+	script.WriteString("set -e\nY='yanglint -D -Y /w/library.xml -p /x'\n")
 	check := func(desc, args string) {
 		fmt.Fprintf(&script, "echo %q; $Y %s\n", desc, args)
 	}
@@ -90,10 +92,16 @@ func TestNetconfInterop(t *testing.T) {
 				}
 				name := fmt.Sprintf("%s-%s.xml", ds, slug)
 				write(name, b.String())
+				// -e: validate against the modules whose data is present.
+				// Without it, CESNET's `notifications` module (RFC 5277 in
+				// YANG) demands its internal top-level container, whose
+				// eventTime is mandatory, from every datastore; no server
+				// holds that. Presence of what nl6 must serve is asserted by
+				// TestNetconfOperationalServesEveryStateTree instead.
 				if ds == netconfOperational {
-					check(name, "-t data /w/"+name)
+					check(name, "-e -t data /w/"+name)
 				} else {
-					check(name, "-t config /w/"+name)
+					check(name, "-e -t config /w/"+name)
 				}
 			}
 		}
@@ -105,8 +113,8 @@ func TestNetconfInterop(t *testing.T) {
 	write("ca.pem", string(pki.caPEM))
 	write("client.pem", string(clientCert))
 	write("client.key", string(clientKey))
-	mgr, dev, addr := startTestNetconf(t, 3, NetconfSubsystemConfig{CertPEM: serverCert, KeyPEM: serverKey, ClientCAPEM: pki.caPEM})
-	dev.resources.oidIndex.Store(".1.3.6.1.2.1.2.2.1.2.1", "Gi0/1")
+	mgr, dev, addr := startTestNetconfWith(t, 3, NetconfSubsystemConfig{CertPEM: serverCert, KeyPEM: serverKey, ClientCAPEM: pki.caPEM},
+		func(d *DeviceSimulator) { d.resources.oidIndex.Store(".1.3.6.1.2.1.2.2.1.2.1", "Gi0/1") })
 	setLink(t, dev, 1, OperUp)
 
 	t.Run("collect live replies and notifications", func(t *testing.T) {
@@ -144,6 +152,49 @@ func TestNetconfInterop(t *testing.T) {
 		replyCheck(fmt.Sprintf(establishPeriodic, "", 100))
 		_, raw = c.next(5 * time.Second)
 		notifCheck(raw)
+
+		// The event stream: alarms, session events, replay, termination.
+		swap := c
+		c = mustDialTestNetconf(t, addr, &client)
+		replyCheck(`<get><filter type="subtree"><alarms xmlns="` + nsAlarms + `"/><streams xmlns="` + nsSubscribedNotif + `"/></filter></get>`)
+		replyCheck(`<get-schema xmlns="` + nsNetconfMonitoring + `"><identifier>nl6-alarm-types</identifier></get-schema>`)
+		stop = time.Now().Add(2 * time.Second).UTC().Format(time.RFC3339Nano)
+		replyCheck(fmt.Sprintf(establishStream, "", "<replay-start-time>2001-01-01T00:00:00Z</replay-start-time><stop-time>"+stop+"</stop-time>"))
+		// The replay holds the alarm raised above and the session-starts;
+		// read up to replay-completed.
+		for {
+			el, raw := c.next(5 * time.Second)
+			notifCheck(raw)
+			if el.Child(nsSubscribedNotif, "replay-completed") != nil {
+				break
+			}
+		}
+		setLink(t, dev, 1, OperUp) // the alarm clears, live
+		_, raw = c.next(5 * time.Second)
+		if !strings.Contains(raw, ">cleared</perceived-severity>") {
+			t.Fatalf("expected the clear: %s", raw)
+		}
+		notifCheck(raw)
+		swap.sendRaw(`<rpc xmlns="` + nsNetconfBase + `" message-id="99"><close-session/></rpc>`)
+		_, raw = c.next(5 * time.Second) // netconf-session-end of the first client
+		if !strings.Contains(raw, "netconf-session-end") {
+			t.Fatalf("expected netconf-session-end: %s", raw)
+		}
+		notifCheck(raw)
+		_, raw = c.next(5 * time.Second) // subscription-terminated at stop-time
+		notifCheck(raw)
+
+		// RFC 5277: create-subscription with replay up to a stopTime.
+		c = mustDialTestNetconf(t, addr, &client)
+		replyCheck(`<create-subscription xmlns="` + nsNetconfNotif + `"><startTime>2001-01-01T00:00:00Z</startTime><stopTime>` +
+			time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano) + `</stopTime></create-subscription>`)
+		for {
+			el, raw := c.next(5 * time.Second)
+			notifCheck(raw)
+			if el.Child(nsNetmodNotification, "notificationComplete") != nil {
+				break
+			}
+		}
 	})
 
 	t.Run("yanglint", func(t *testing.T) {
@@ -171,8 +222,10 @@ func TestNetconfInterop(t *testing.T) {
 		// sends (get-data with config-filter was the first); any it refuses
 		// shows up here even when the CLI recovers by falling back.
 		errorsBefore := mgr.netconf.rpcErrors.Load()
-		cmds := fmt.Sprintf("searchpath /x\nconnect --tls --host %s --port %s --cert /w/client.pem --key /w/client.key --trusted /w/ca.pem\n"+
+		alarmsBefore := mgr.netconf.eventNotifications.Load()
+		cmds := fmt.Sprintf("connect --tls --host %s --port %s --cert /w/client.pem --key /w/client.key --trusted /w/ca.pem\n"+
 			"get-data --datastore operational --filter-subtree=/w/filter.xml\n"+
+			"establish-sub --stream NETCONF --filter-xpath /ietf-alarms:alarm-notification\n"+
 			"establish-push --datastore operational --on-change --no-sync-on-start\n", host, port)
 		type result struct {
 			out string
@@ -187,7 +240,7 @@ func TestNetconfInterop(t *testing.T) {
 			done <- result{out, err}
 		}()
 		deadline := time.Now().Add(20 * time.Second)
-		for mgr.netconf.subscriptionsActive.Load() == 0 {
+		for mgr.netconf.subscriptionsActive.Load() < 2 {
 			if time.Now().After(deadline) {
 				r := <-done
 				t.Fatalf("netopeer2-cli never established a subscription: %v\n%s", r.err, tail(r.out, 60))
@@ -205,7 +258,11 @@ func TestNetconfInterop(t *testing.T) {
 		if mgr.netconf.pushChangeUpdates.Load() == before {
 			t.Fatalf("no push-change-update was sent to netopeer2-cli:\n%s", tail(r.out, 60))
 		}
-		for _, want := range []string{"<oper-status", ">up</oper-status>", "push-change-update", "interface=Gi0%2F1/oper-status"} {
+		if mgr.netconf.eventNotifications.Load() == alarmsBefore {
+			t.Fatalf("no alarm-notification was sent to netopeer2-cli:\n%s", tail(r.out, 60))
+		}
+		for _, want := range []string{"<oper-status", ">up</oper-status>", "push-change-update", "interface=Gi0%2F1/oper-status",
+			"<alarm-notification", "nl6-at:link-down", "<perceived-severity>major</perceived-severity>"} {
 			if !strings.Contains(r.out, want) {
 				t.Errorf("netopeer2-cli output lacks %q:\n%s", want, tail(r.out, 60))
 			}

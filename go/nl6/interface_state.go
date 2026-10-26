@@ -138,6 +138,14 @@ type InterfaceState struct {
 	// transition before attach reads nil and is a safe no-op.
 	notify atomic.Pointer[func(StateChange)]
 
+	// observers are synchronous per-event hooks for consumers that must see
+	// every transition even when nobody is connected, which a listener
+	// channel cannot give without a goroutine per device: the NETCONF event
+	// log keeps a device's alarm list and replay buffer this way. Copy on
+	// write under observersMu; Broadcast reads the slice with one load.
+	observers   atomic.Pointer[[]*stateObserver]
+	observersMu sync.Mutex
+
 	// onOper is the counter cycler's hold hook, invoked from Broadcast for
 	// every event whose Changed includes LeafOperStatus, child cascades
 	// included. Set once by setOperHook before the engine is published and
@@ -825,6 +833,41 @@ func (s *InterfaceState) RemoveListener(ch chan StateChange) {
 	s.listeners.Delete(ch)
 }
 
+// stateObserver wraps an observer so removal can find it by identity
+// (funcs are not comparable).
+type stateObserver struct{ fn func(StateChange) }
+
+// AddObserver registers fn to run synchronously in Broadcast for every
+// event, after the listener fan-out. fn runs on the mutating goroutine, so
+// it must be quick and must not block or call back into the engine's
+// mutators. The returned func removes it; calling it twice is harmless.
+func (s *InterfaceState) AddObserver(fn func(StateChange)) (remove func()) {
+	o := &stateObserver{fn: fn}
+	s.observersMu.Lock()
+	var next []*stateObserver
+	if cur := s.observers.Load(); cur != nil {
+		next = append(next, *cur...)
+	}
+	next = append(next, o)
+	s.observers.Store(&next)
+	s.observersMu.Unlock()
+	return func() {
+		s.observersMu.Lock()
+		defer s.observersMu.Unlock()
+		cur := s.observers.Load()
+		if cur == nil {
+			return
+		}
+		next := make([]*stateObserver, 0, len(*cur))
+		for _, x := range *cur {
+			if x != o {
+				next = append(next, x)
+			}
+		}
+		s.observers.Store(&next)
+	}
+}
+
 // SetCounters wires the per-engine atomic counter pointers to the
 // simulator-wide aggregates. Called by SimulatorManager once per
 // device construction; safe to call multiple times at runtime — the
@@ -921,6 +964,12 @@ func (s *InterfaceState) Broadcast(evt StateChange) {
 		return true
 	})
 
+	if obs := s.observers.Load(); obs != nil {
+		for _, o := range *obs {
+			s.runObserver(o, evt)
+		}
+	}
+
 	// Tier C (correlate-state-notifications): after the gNMI listener fan-out,
 	// fire correlated link telemetry for OPER transitions. Gated on
 	// LeafOperStatus so admin-only changes never fire link traps/syslog. The
@@ -930,6 +979,17 @@ func (s *InterfaceState) Broadcast(evt StateChange) {
 			(*fn)(evt)
 		}
 	}
+}
+
+// runObserver isolates one observer: a panic in it must not abort the
+// mutator that called Broadcast, nor skip the Tier C hook after it.
+func (s *InterfaceState) runObserver(o *stateObserver, evt StateChange) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("interface_state: observer panic recovered: %v", r)
+		}
+	}()
+	o.fn(evt)
 }
 
 func (s *InterfaceState) incEmitted() {

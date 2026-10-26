@@ -1,0 +1,52 @@
+/*
+ * Copyright 2026 Ronny Trommer <ronny@no42.org>
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+module nl6-alarm-types {
+  yang-version 1.1;
+  namespace "https://labmonkeys-space.github.io/nl6/yang/nl6-alarm-types";
+  prefix nl6-at;
+
+  import ietf-alarms {
+    prefix al;
+    reference
+      "RFC 8632: A YANG Data Model for Alarm Management";
+  }
+
+  organization
+    "nl6 network device simulator";
+  contact
+    "https://github.com/labmonkeys-space/nl6";
+  description
+    "The alarm types nl6 simulated devices raise in the RFC 8632
+     alarm list and alarm-notification. RFC 8632 defines no concrete
+     alarm types, so a system defines its own.";
+
+  revision 2026-10-26 {
+    description
+      "Initial revision: link-down.";
+  }
+
+  identity nl6-alarm-type-id {
+    base al:alarm-type-id;
+    description
+      "Base of the alarm types nl6 raises.";
+  }
+
+  identity link-alarm {
+    base nl6-alarm-type-id;
+    description
+      "Abstract base of alarms about an interface's link.";
+  }
+
+  identity link-down {
+    base link-alarm;
+    description
+      "The interface is administratively up and its operational
+       status is down. Raised with severity major when the
+       interface goes down and cleared when it comes up or is
+       shut down administratively. The resource is the interface
+       in ietf-interfaces.";
+  }
+}

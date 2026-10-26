@@ -40,6 +40,10 @@ type netconfServer struct {
 
 	conns atomic.Int32 // accepted connections not yet finished
 
+	// events is the device's NETCONF stream and alarm list, live from
+	// startNetconfServer to stopNetconfServer.
+	events *netconfEventLog
+
 	view atomic.Pointer[netconfIfaces]
 }
 
@@ -63,6 +67,7 @@ func (d *DeviceSimulator) startNetconfServer(port int) error {
 		return fmt.Errorf("failed to start NETCONF server on %s: %v", addr, err)
 	}
 	srv := &netconfServer{dev: d, mgr: mgr, ln: ln, sessions: map[uint32]*netconfSession{}}
+	srv.events = newNetconfEventLog(srv)
 	d.netconfServer = srv
 	srv.wg.Add(1)
 	go srv.acceptLoop()
@@ -87,7 +92,7 @@ func (d *DeviceSimulator) stopNetconfServer() {
 	srv.mu.Unlock()
 	_ = srv.ln.Close()
 	for _, s := range sessions {
-		s.close()
+		s.closeWith("other", 0) // RFC 6470: the server ended it
 	}
 	done := make(chan struct{})
 	go func() {
@@ -98,6 +103,7 @@ func (d *DeviceSimulator) stopNetconfServer() {
 	case <-done:
 	case <-time.After(netconfStopTimeout):
 	}
+	srv.events.close()
 }
 
 func (srv *netconfServer) acceptLoop() {
@@ -147,6 +153,15 @@ func (srv *netconfServer) serveConn(raw net.Conn) {
 		rd:   newNetconfReader(conn, netconfMaxMessageBytes),
 		subs: map[uint32]*netconfSubscription{},
 		done: make(chan struct{}),
+	}
+	if cs := conn.ConnectionState(); len(cs.PeerCertificates) > 0 {
+		s.user = cs.PeerCertificates[0].Subject.CommonName
+	}
+	if s.user == "" {
+		s.user = "unknown" // RFC 6470 username is mandatory
+	}
+	if host, _, err := net.SplitHostPort(raw.RemoteAddr().String()); err == nil {
+		s.source = host
 	}
 	srv.mu.Lock()
 	if srv.closed {
@@ -238,7 +253,10 @@ func (srv *netconfServer) datastore(ds netconfDatastoreName, now time.Time) []*n
 		out = append(out, ifs)
 	}
 	if ds == netconfOperational {
-		out = append(out, netconfYangLibrary(), netconfModulesState())
+		out = append(out, netconfYangLibrary(), netconfModulesState(), netconfMonitoringSchemas())
+		if srv.events != nil {
+			out = append(out, srv.events.alarmsNode(), srv.events.streamsNode(), srv.events.netconfStreamsNode())
+		}
 	}
 	return out
 }

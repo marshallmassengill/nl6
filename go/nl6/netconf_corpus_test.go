@@ -25,7 +25,10 @@ func shippedNetconfServer(t *testing.T, sm *SimulatorManager, profile string) *n
 	mc := NewMetricsCycler(0, GetDeviceProfile(""))
 	mc.InitIfCountersWithScenario(res, 1, IfErrorClean)
 	dev := &DeviceSimulator{ID: profile, IP: net.IPv4(10, 42, 0, 1), resources: res, metricsCycler: mc, resourceFile: profile}
-	return &netconfServer{dev: dev}
+	srv := &netconfServer{dev: dev}
+	srv.events = newNetconfEventLog(srv)
+	t.Cleanup(srv.events.close)
+	return srv
 }
 
 // TestNetconfIfTypeCoversShippedCorpus fails by value when a shipped profile
@@ -115,5 +118,31 @@ func TestNetconfShadowedNamesAreCounted(t *testing.T) {
 	sort.Ints(got)
 	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
 		t.Fatalf("served ifIndex %v, want [1 2]", got)
+	}
+}
+
+// TestNetconfOperationalServesEveryStateTree pins the top-level trees the
+// operational datastore must carry. The interop check validates with
+// yanglint -e, which requires only the modules whose data is present, so an
+// omitted tree would pass there; this is what fails instead.
+func TestNetconfOperationalServesEveryStateTree(t *testing.T) {
+	sm := &SimulatorManager{resourcesCache: make(map[string]*DeviceResources)}
+	srv := shippedNetconfServer(t, sm, shippedProfileNames(t)[0])
+	got := map[string]bool{}
+	for _, n := range srv.datastore(netconfOperational, time.Now()) {
+		got[n.NS+" "+n.Name] = true
+	}
+	for _, want := range []string{
+		nsIETFInterfaces + " interfaces",
+		nsYangLibrary + " yang-library",
+		nsYangLibrary + " modules-state",
+		nsNetconfMonitoring + " netconf-state",
+		nsAlarms + " alarms",
+		nsSubscribedNotif + " streams",
+		nsNetmodNotification + " netconf",
+	} {
+		if !got[want] {
+			t.Errorf("operational datastore lacks %s", want)
+		}
 	}
 }

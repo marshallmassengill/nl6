@@ -22,15 +22,23 @@ import (
 
 // Namespaces the server reads or writes.
 const (
-	nsNetconfBase     = "urn:ietf:params:xml:ns:netconf:base:1.0"
-	nsNetconfNotif    = "urn:ietf:params:xml:ns:netconf:notification:1.0"
-	nsNetconfNMDA     = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda"
-	nsDatastores      = "urn:ietf:params:xml:ns:yang:ietf-datastores"
-	nsSubscribedNotif = "urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications"
-	nsYangPush        = "urn:ietf:params:xml:ns:yang:ietf-yang-push"
-	nsYangLibrary     = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
-	nsIETFInterfaces  = "urn:ietf:params:xml:ns:yang:ietf-interfaces"
-	nsIANAIfType      = "urn:ietf:params:xml:ns:yang:iana-if-type"
+	nsNetconfBase       = "urn:ietf:params:xml:ns:netconf:base:1.0"
+	nsNetconfNotif      = "urn:ietf:params:xml:ns:netconf:notification:1.0"
+	nsNetconfNMDA       = "urn:ietf:params:xml:ns:yang:ietf-netconf-nmda"
+	nsDatastores        = "urn:ietf:params:xml:ns:yang:ietf-datastores"
+	nsSubscribedNotif   = "urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications"
+	nsYangPush          = "urn:ietf:params:xml:ns:yang:ietf-yang-push"
+	nsYangLibrary       = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
+	nsIETFInterfaces    = "urn:ietf:params:xml:ns:yang:ietf-interfaces"
+	nsIANAIfType        = "urn:ietf:params:xml:ns:yang:iana-if-type"
+	nsAlarms            = "urn:ietf:params:xml:ns:yang:ietf-alarms"
+	nsNl6AlarmTypes     = "https://labmonkeys-space.github.io/nl6/yang/nl6-alarm-types"
+	nsNetconfMonitoring = "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"
+	// nsNetconfNotifications is RFC 6470's session and config events.
+	nsNetconfNotifications = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications"
+	// nsNetmodNotification is RFC 5277's replayComplete and
+	// notificationComplete, which RFC 5277 defines in XSD, not YANG.
+	nsNetmodNotification = "urn:ietf:params:xml:ns:netmod:notification"
 )
 
 // netconfMaxXMLDepth bounds element nesting in anything a client sends. The

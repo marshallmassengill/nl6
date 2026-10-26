@@ -479,23 +479,16 @@ test-interop-pyroscope: check-go check-docker
 ## test-interop-netconf: Check nl6's NETCONF server with libyang and netopeer2-cli (needs docker)
 ##
 ## Runs TestNetconfInterop: yanglint builds its schema from the YANG library
-## nl6 serves and validates every shipped profile's datastores plus live
-## replies and notifications; netopeer2-cli runs a mutual-TLS session with an
-## on-change establish-push. The notconf image carries both tools and the
-## IETF modules, except RFC 6241's ietf-netconf@2011-06-01 (it ships
-## libnetconf2's 2013-09-29 variant), which is fetched from the YangModels
-## commit the gNMI catalogue already pins and checked against its digest.
-## --network host (for netopeer2-cli) needs Linux.
+## nl6 serves, searching only the modules nl6 embeds for get-schema
+## (go/nl6/netconf_yang, provenance in SOURCES.tsv), and validates every
+## shipped profile's datastores plus live replies and notifications;
+## netopeer2-cli runs a mutual-TLS session that must resolve what it lacks
+## through get-schema, take an on-change push and a NETCONF-stream alarm,
+## and draw no rpc-error. --network host (for netopeer2-cli) needs Linux.
 NETCONF_INTEROP_IMAGE ?= ghcr.io/notconf/notconf:debug
-NETCONF_YANG_DIR = $(YANG_CACHE)/netconf-interop
-IETF_NETCONF_SHA256 = 6c1d0b39e789b53ea13b7ea6703c2dcb199157a7b011ce30af4ca61b8ba9b13f
 test-interop-netconf: check-go check-docker
-	@mkdir -p $(NETCONF_YANG_DIR)
-	@f=$(NETCONF_YANG_DIR)/ietf-netconf@2011-06-01.yang; \
-	[ -f $$f ] || curl -fsSL -o $$f "https://raw.githubusercontent.com/YangModels/yang/$(CISCO_YANG_COMMIT)/standard/ietf/RFC/ietf-netconf%402011-06-01.yang"; \
-	echo "$(IETF_NETCONF_SHA256)  $$f" | sha256sum -c --quiet || { rm -f $$f; echo "ietf-netconf@2011-06-01.yang digest mismatch"; exit 1; }
 	docker pull -q $(NETCONF_INTEROP_IMAGE) >/dev/null
-	cd $(GO_DIR) && NL6_NETCONF_INTEROP=1 NL6_NETCONF_IMAGE=$(NETCONF_INTEROP_IMAGE) NL6_NETCONF_YANG_DIR=$(abspath $(NETCONF_YANG_DIR)) \
+	cd $(GO_DIR) && NL6_NETCONF_INTEROP=1 NL6_NETCONF_IMAGE=$(NETCONF_INTEROP_IMAGE) \
 	  go test ./nl6/ -run 'TestNetconfInterop' -count=1 -v -timeout 10m
 
 ## test-interop-ipfix: Decode nl6's IPFIX / NBAR2 export with a REAL IPFIXcol2 container (needs docker)

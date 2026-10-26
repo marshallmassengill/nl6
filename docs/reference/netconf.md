@@ -2,9 +2,13 @@
 
 With `-netconf-enable`, every simulated device runs a NETCONF server over TLS ([RFC 7589](https://www.rfc-editor.org/rfc/rfc7589)) on TCP port 6513.
 It serves `ietf-interfaces` ([RFC 8343](https://www.rfc-editor.org/rfc/rfc8343)) and pushes it to subscribers with YANG-Push ([RFC 8639](https://www.rfc-editor.org/rfc/rfc8639) / [RFC 8641](https://www.rfc-editor.org/rfc/rfc8641)), both periodically and on change.
-Values come from the same interface state engine and counter cycler that serve SNMP and gNMI, so a link flap caused through the REST API or the flap scheduler appears in `ifOperStatus`, in gNMI ON_CHANGE, in link traps, and as a NETCONF `push-change-update`.
+It also publishes the `NETCONF` event stream, carrying `ietf-alarms` ([RFC 8632](https://www.rfc-editor.org/rfc/rfc8632)) link alarms and [RFC 6470](https://www.rfc-editor.org/rfc/rfc6470) session events, with replay.
+That stream can be subscribed to through RFC 8639 or [RFC 5277](https://www.rfc-editor.org/rfc/rfc5277).
 
-The server is read-only. It answers `get`, `get-config`, `get-data`, and the subscription RPCs, and it refuses edits.
+Values come from the same interface state engine and counter cycler that serve SNMP and gNMI.
+A link flap caused through the REST API or the flap scheduler therefore appears in `ifOperStatus`, in gNMI ON_CHANGE, in link traps, as a NETCONF `push-change-update`, and as an `alarm-notification`.
+
+The server is read-only. It answers `get`, `get-config`, `get-data`, `get-schema`, and the subscription RPCs, and it refuses edits.
 
 ## Enablement
 
@@ -45,9 +49,13 @@ The username RFC 7589 derives from a client certificate is not used, because not
 
 ### Capabilities
 
-The hello advertises `base:1.0` and `base:1.1` (chunked framing is used when the client also offers 1.1), `:interleave`, and `:yang-library:1.1`.
+The hello advertises the following:
+
+- `base:1.0` and `base:1.1`; chunked framing is used when the client also offers 1.1.
+- `:interleave`, `:notification:1.0`, and `:yang-library:1.1`.
+
 Modules are announced through the YANG library.
-The two YANG 1.0 modules, `ietf-netconf` and `iana-if-type`, are also listed in the hello, as [RFC 7950 §5.6.4](https://www.rfc-editor.org/rfc/rfc7950#section-5.6.4) requires.
+The YANG 1.0 modules are also listed in the hello, as [RFC 7950 §5.6.4](https://www.rfc-editor.org/rfc/rfc7950#section-5.6.4) requires: `ietf-netconf`, `iana-if-type`, `ietf-netconf-notifications`, `ietf-netconf-monitoring`, `notifications`, and `nc-notifications`.
 
 `/yang-library` ([RFC 8525](https://www.rfc-editor.org/rfc/rfc8525)) and the deprecated `/modules-state` ([RFC 7895](https://www.rfc-editor.org/rfc/rfc7895)) both list the schema:
 
@@ -59,11 +67,33 @@ The two YANG 1.0 modules, `ietf-netconf` and `iana-if-type`, are also listed in 
 | `ietf-datastores` | 2018-02-14 | |
 | `ietf-netconf` | 2011-06-01 | |
 | `ietf-netconf-nmda` | 2019-01-07 | |
-| `ietf-subscribed-notifications` | 2019-09-09 | `encode-xml`, `subtree`, `xpath` |
+| `ietf-subscribed-notifications` | 2019-09-09 | `encode-xml`, `replay`, `subtree`, `xpath` |
 | `ietf-yang-push` | 2019-09-09 | `on-change` |
+| `ietf-alarms` | 2019-09-11 | |
+| `nl6-alarm-types` | 2026-10-26 | |
+| `ietf-netconf-notifications` | 2012-02-06 | |
+| `ietf-netconf-monitoring` | 2010-10-04 | |
+| `notifications` | 2008-07-14 | |
+| `nc-notifications` | 2008-07-14 | |
 
 The import closure of these modules is listed as import-only.
-Its revisions were read from the published modules, and `make test-interop-netconf` builds a libyang context from exactly this library, so a wrong revision or a missing import fails there.
+
+RFC 5277 defines its schema in XSD, not YANG.
+`notifications` and `nc-notifications` are CESNET's YANG renderings of it, which Netopeer2 also serves.
+They are listed because libnetconf2 clients (v3.7.1) crash on a server that advertises `:notification:1.0` without them.
+The crash is in `build_module_info_yl`, which appends the two modules to an array it does not terminate.
+
+`nl6-alarm-types` is nl6's own module: RFC 8632 defines no concrete alarm types, so a system defines its own.
+
+### get-schema
+
+Every module in the library, implemented and import-only, is served by `get-schema` ([RFC 6022](https://www.rfc-editor.org/rfc/rfc6022)) and listed in `/netconf-state/schemas`.
+A client can therefore build its schema from the device alone.
+netopeer2-cli does exactly that for `ietf-alarms`, `nl6-alarm-types`, and RFC 6241's `ietf-netconf@2011-06-01`, which it does not ship.
+
+The IETF modules are embedded unmodified from YangModels/yang at a pinned commit.
+`go/nl6/netconf_yang/SOURCES.tsv` records each file's source and digest, and a test recomputes them.
+`make test-interop-netconf` builds its libyang context from these files alone, so a wrong revision or a missing import fails there.
 
 ### Datastores
 
@@ -73,7 +103,7 @@ Two datastores are served: `running` and `operational`.
 | Datastore | Content |
 |-----------|---------|
 | `running` | `/interfaces/interface`: `name`, `type`, `enabled` |
-| `operational` | The running nodes plus `admin-status`, `oper-status`, `last-change`, `if-index`, `higher-layer-if`, `lower-layer-if`, `speed` and `statistics`. Also `/yang-library` and `/modules-state`. |
+| `operational` | The running nodes plus `admin-status`, `oper-status`, `last-change`, `if-index`, `higher-layer-if`, `lower-layer-if`, `speed` and `statistics`. Also `/yang-library`, `/modules-state`, `/netconf-state/schemas`, `/alarms` (inventory and alarm list), `/streams` (RFC 8639) and `/netconf/streams` (RFC 5277). |
 
 Mapping from the device profile:
 
@@ -99,9 +129,10 @@ In the shipped corpus this affects `dlink_dgs3630`, whose ifIndex 49 to 52 repea
 | `get-data` (RFC 8526) | `ds:operational` and `ds:running`, with `subtree-filter` or `xpath-filter`, and `config-filter`. `max-depth` is accepted only as `unbounded`. The origin and with-defaults parameters return `operation-not-supported`. |
 | `lock`, `unlock` | The running datastore. A lock held by another session is refused with `lock-denied`, naming the holder. |
 | `close-session`, `kill-session` | Supported. Killing a session releases its lock and its subscriptions. |
-| `establish-subscription`, `delete-subscription` | See [YANG-Push](#yang-push). |
+| `get-schema` (RFC 6022) | Every library module, format `yang`. |
+| `establish-subscription`, `delete-subscription` | To a datastore, see [YANG-Push](#yang-push); to the `NETCONF` stream, see [Event stream](#event-stream). |
+| `create-subscription` (RFC 5277) | To the `NETCONF` stream; see [Event stream](#event-stream). |
 | `edit-config`, `copy-config`, `delete-config`, `validate`, `commit`, `discard-changes`, `cancel-commit` | `operation-not-supported`: the data is read-only. |
-| `create-subscription` (RFC 5277) | `operation-not-supported`: no event streams are published. |
 
 A malformed message is answered with `malformed-message`, and the session stays open.
 A missing `message-id` is answered with `missing-attribute`.
@@ -174,7 +205,10 @@ RFC 8639's `subscription-completed` is `if-feature configured`, and nl6 has no c
 
 | Request | Error |
 |---------|-------|
-| `stream`, stream filters, `replay-start-time` | `invalid-value`, app tag `ietf-subscribed-notifications:stream-unavailable` |
+| A `stream` other than `NETCONF` | `invalid-value`, app tag `ietf-subscribed-notifications:stream-unavailable` |
+| `stream` together with `datastore`, or periodic/on-change on a stream | `invalid-value` |
+| `replay-start-time` in the future | `ietf-subscribed-notifications:replay-unsupported` |
+| `stream-filter-name` | `ietf-subscribed-notifications:filter-unavailable` |
 | A datastore other than running or operational | `ietf-yang-push:datastore-not-subscribable` |
 | An XPath filter outside the subset | `ietf-subscribed-notifications:filter-unsupported` |
 | `selection-filter-ref` | `ietf-subscribed-notifications:filter-unavailable` |
@@ -183,12 +217,55 @@ RFC 8639's `subscription-completed` is `if-feature configured`, and nl6 has no c
 | A ninth subscription on one session | `ietf-subscribed-notifications:insufficient-resources` |
 | `stop-time` not in the future | `invalid-value` |
 
+## Event stream
+
+Each device publishes one stream, `NETCONF`.
+It carries the following notifications:
+
+| Notification | When |
+|--------------|------|
+| `ietf-alarms:alarm-notification`, severity `major` | An interface is administratively up and its oper-status becomes `down`. Alarm type `nl6-at:link-down`, resource `/if:interfaces/if:interface[if:name='…']`. |
+| `ietf-alarms:alarm-notification`, severity `cleared` | That interface comes up, or is shut down administratively. |
+| `ietf-netconf-notifications:netconf-session-start` | A NETCONF session completes its hello. `username` is the client certificate's common name. |
+| `ietf-netconf-notifications:netconf-session-end` | It ends. `termination-reason` is one of the following: `closed` (close-session), `killed` (with `killed-by`), `dropped` (the connection went away), or `other` (the device stopped). |
+
+Alarm rules:
+
+- Admin down does not raise an alarm, because a shutdown is deliberate.
+- `lower-layer-down` does not raise one either. A subinterface following its parent is a consequence of the parent's alarm, not a fault of its own.
+- An interface already alarmed when the device starts is in the alarm list from the start, dated from its last change. No notification is sent for it, since nothing changed while anyone could listen.
+- A cleared alarm **stays in the alarm list** with `is-cleared true`, as RFC 8632 intends. Purging is an operator action, and nl6 has none.
+- `/alarms/alarm-inventory` lists `link-down`.
+- The device does not purge, shelve, or record status-change history (the `alarm-history` feature is not claimed).
+
+The stream is recorded whether or not anyone is subscribed.
+A collector that connects later therefore finds a truthful alarm list, and can replay the stream.
+
+### Subscribing
+
+- **RFC 8639:** `establish-subscription` with `<stream>NETCONF</stream>`, an optional `stream-subtree-filter` or `stream-xpath-filter`, `replay-start-time`, and `stop-time`.
+  - A replay ends with `replay-completed`.
+  - When the start time is older than the buffer, the reply carries `replay-start-time-revision`, as RFC 8639 §2.4.2.1 specifies.
+  - At `stop-time` the subscription ends with `subscription-terminated`, as for datastore subscriptions.
+- **RFC 5277:** `create-subscription` with `stream`, `filter`, `startTime`, and `stopTime`.
+  - One is allowed per session, and it has no id that `delete-subscription` can name.
+  - A replay ends with `replayComplete`.
+  - `stopTime` requires `startTime`, and the subscription ends at it with `notificationComplete`.
+
+Filters apply to the notification content: `/ietf-alarms:alarm-notification` selects alarms only.
+
+The replay buffer holds the last 256 records per device.
+`/streams` reports `replay-log-creation-time` (when the device started) and, once records have aged out, `replay-log-aged-time`.
+A subscription's queue holds 64 records; when it is full, the oldest is dropped and counted in `stream_records_dropped`.
+
 ## Limits
 
 | Limit | Value | What happens at the limit |
 |-------|-------|---------------------------|
 | Connections per device | 16 | Further connections are closed before the handshake and counted in `sessions_refused`. |
-| Subscriptions per session | 8 | `insufficient-resources`. |
+| Subscriptions per session (datastore and stream together) | 8 | `insufficient-resources`. |
+| Replay buffer | 256 records per device | The oldest record ages out; `replay-log-aged-time` moves. |
+| Stream subscription queue | 64 records | The oldest is dropped and counted. |
 | Inbound message size | 1 MiB | The session is closed, since the stream cannot be resynchronised. |
 | TLS handshake plus client hello | 30 s | The connection is closed. |
 | One framed write | 10 s | The session is closed, because a partial frame cannot be repaired. |
@@ -219,6 +296,8 @@ Like gNMI dial-in SAMPLE, a periodic subscription is requested by the collector,
   "subscriptions_active": 2,
   "push_updates": 120,
   "push_change_updates": 7,
+  "event_notifications": 12,
+  "stream_records_dropped": 0,
   "notification_write_failures": 0
 }
 ```
@@ -252,24 +331,32 @@ The `auto` mode also picks RFC 8639: it reads `ietf-subscribed-notifications` fr
 
 - Each edit of a `push-change-update` becomes an OpenNMS event, with `target` and the changed leaf as parameters.
 - At the time of writing, the OpenNMS adapter drops periodic `push-update` notifications ("for a metrics adapter"), so on-change is the path that produces events.
-- Event-stream subscriptions, such as the shipped package's `NETCONF` stream for `ietf-alarms`, are refused with `stream-unavailable`. Use a package without them.
+- The subscription groups of the connector's shipped default package also work against nl6, once the package is pointed at TLS: set `transport`, `port` and the certificate parameters as above, since the shipped package uses SSH. Its two groups are on the `NETCONF` stream:
+  - `/ietf-alarms:alarm-notification` raises and clears `link-down` alarms, through the shipped `ietf-alarms` event definitions.
+  - `/ietf-netconf-notifications:netconf-config-change` never fires, because nl6 is read-only.
+- With the `alarms` group's default `reconcile=additive`, the connector reads `/alarms/alarm-list` after each connect and raises every alarm that is not cleared.
+  Interfaces that were already down when the session started therefore become OpenNMS alarms too.
+- `replay=true` works: after a reconnect, the connector asks for what it missed, within the 256-record buffer.
+- `ietf-alarms` and `ietf-netconf-notifications` are IETF namespaces, so the adapter names them without uploading a module.
+  `nl6-alarm-types` appears only as the `alarm-type-id` parameter value. You can upload it from `get-schema` or `go/nl6/netconf_yang/` if you want it in the YANG Modules registry.
 
 ## Verification
 
 `make test-interop-netconf` checks nl6 against independent implementations, using the `ghcr.io/notconf/notconf:debug` image:
 
-- `yanglint` builds its schema from the YANG library nl6 serves.
-- It validates the operational and running datastores of every shipped profile, the live rpc-replies, and the `push-update`, `push-change-update` and `subscription-terminated` notifications, envelopes included.
-- `netopeer2-cli` runs a mutual-TLS session against the real listener: `get-data`, then an on-change `establish-push` that must deliver a link flap.
-
-The image ships libnetconf2's `ietf-netconf@2013-09-29`, not RFC 6241's `2011-06-01` that nl6 advertises.
-The target fetches the RFC module from the YangModels commit the gNMI catalogue already pins and checks its digest.
+- `yanglint` builds its schema from the YANG library nl6 serves, using only the modules nl6 embeds for `get-schema`.
+- It validates the following, envelopes included:
+  - the operational and running datastores of every shipped profile, alarm lists and streams included;
+  - the live rpc-replies, including `get-schema`;
+  - `push-update`, `push-change-update`, `alarm-notification`, `netconf-session-start`, `netconf-session-end`, `replay-completed`, `subscription-terminated`, `replayComplete`, and `notificationComplete`.
+- `netopeer2-cli` runs a mutual-TLS session against the real listener with no local copy of nl6's extra modules, so it must resolve them through `get-schema`.
+- In that session it runs `get-data`, then an on-change `establish-push` and an `establish-sub` on the `NETCONF` stream. Both must deliver a link flap, and no request may draw an rpc-error.
 
 ## Not implemented
 
 - NETCONF over SSH (RFC 6242) and Call Home (RFC 8071).
-- Event streams: RFC 5277 `create-subscription`, the `NETCONF` stream, and `ietf-alarms` (RFC 8632) notifications.
-- `get-schema` (RFC 6022). Clients resolve modules from their own copies.
+- Event streams other than `NETCONF`, and notifications other than link alarms and session events.
 - Configured subscriptions, `modify-subscription`, `kill-subscription` and `resync-subscription`.
+- Alarm operator actions, shelving, history, and purge.
 - Writable datastores and NACM.
 - The OpenConfig models gNMI serves. NETCONF serves the IETF interface model only.

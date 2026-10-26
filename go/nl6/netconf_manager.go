@@ -69,6 +69,8 @@ type netconfSubsystem struct {
 	subscriptionsActive       atomic.Int64
 	pushUpdates               atomic.Uint64
 	pushChangeUpdates         atomic.Uint64
+	eventNotifications        atomic.Uint64
+	streamRecordsDropped      atomic.Uint64
 	notificationWriteFailures atomic.Uint64
 
 	firstHandshakeErr sync.Once
@@ -82,19 +84,23 @@ type NetconfStatus struct {
 	ClientAuth      string `json:"client_auth,omitempty"`
 	// ServerCertSHA256 is the leaf certificate's fingerprint in the colon
 	// hex form OpenSSL prints, for a collector that pins by fingerprint.
-	ServerCertSHA256          string `json:"server_cert_sha256,omitempty"`
-	Listeners                 int    `json:"listeners"`
-	SessionsActive            int64  `json:"sessions_active"`
-	SessionsTotal             uint64 `json:"sessions_total"`
-	SessionsRefused           uint64 `json:"sessions_refused"`
-	TLSHandshakeFailures      uint64 `json:"tls_handshake_failures"`
-	ListenerAcceptFailures    uint64 `json:"listener_accept_failures"`
-	HelloFailures             uint64 `json:"hello_failures"`
-	RPCs                      uint64 `json:"rpcs"`
-	RPCErrors                 uint64 `json:"rpc_errors"`
-	SubscriptionsActive       int64  `json:"subscriptions_active"`
-	PushUpdates               uint64 `json:"push_updates"`
-	PushChangeUpdates         uint64 `json:"push_change_updates"`
+	ServerCertSHA256       string `json:"server_cert_sha256,omitempty"`
+	Listeners              int    `json:"listeners"`
+	SessionsActive         int64  `json:"sessions_active"`
+	SessionsTotal          uint64 `json:"sessions_total"`
+	SessionsRefused        uint64 `json:"sessions_refused"`
+	TLSHandshakeFailures   uint64 `json:"tls_handshake_failures"`
+	ListenerAcceptFailures uint64 `json:"listener_accept_failures"`
+	HelloFailures          uint64 `json:"hello_failures"`
+	RPCs                   uint64 `json:"rpcs"`
+	RPCErrors              uint64 `json:"rpc_errors"`
+	SubscriptionsActive    int64  `json:"subscriptions_active"`
+	PushUpdates            uint64 `json:"push_updates"`
+	PushChangeUpdates      uint64 `json:"push_change_updates"`
+	// EventNotifications counts NETCONF-stream notifications sent:
+	// alarm-notification, netconf-session-start and netconf-session-end.
+	EventNotifications        uint64 `json:"event_notifications"`
+	StreamRecordsDropped      uint64 `json:"stream_records_dropped"`
 	NotificationWriteFailures uint64 `json:"notification_write_failures"`
 }
 
@@ -218,6 +224,8 @@ func (sm *SimulatorManager) GetNetconfStatus() NetconfStatus {
 		SubscriptionsActive:       nc.subscriptionsActive.Load(),
 		PushUpdates:               nc.pushUpdates.Load(),
 		PushChangeUpdates:         nc.pushChangeUpdates.Load(),
+		EventNotifications:        nc.eventNotifications.Load(),
+		StreamRecordsDropped:      nc.streamRecordsDropped.Load(),
 		NotificationWriteFailures: nc.notificationWriteFailures.Load(),
 	}
 	if !st.SubsystemActive {

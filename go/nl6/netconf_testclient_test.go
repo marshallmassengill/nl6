@@ -98,6 +98,14 @@ func (p *testPKI) issuePEM(t *testing.T, cn string, usage x509.ExtKeyUsage) (cer
 // ifCount interfaces on 127.0.0.1, through startNetconfServer itself.
 func startTestNetconf(t *testing.T, ifCount int, cfg NetconfSubsystemConfig) (*SimulatorManager, *DeviceSimulator, string) {
 	t.Helper()
+	return startTestNetconfWith(t, ifCount, cfg, nil)
+}
+
+// startTestNetconfWith is startTestNetconf with prep run on the device
+// before its server starts, which is when the server fixes the interface
+// names it serves.
+func startTestNetconfWith(t *testing.T, ifCount int, cfg NetconfSubsystemConfig, prep func(*DeviceSimulator)) (*SimulatorManager, *DeviceSimulator, string) {
+	t.Helper()
 	mgr := &SimulatorManager{
 		devices:         map[string]*DeviceSimulator{},
 		deviceIPs:       map[string]struct{}{},
@@ -114,6 +122,9 @@ func startTestNetconf(t *testing.T, ifCount int, cfg NetconfSubsystemConfig) (*S
 
 	dev := newTestGnmiDevice(t, ifCount)
 	dev.IP = net.IPv4(127, 0, 0, 1)
+	if prep != nil {
+		prep(dev)
+	}
 	mgr.devices["test"] = dev
 	dev.mu.Lock()
 	err := dev.startNetconfServer(0)
