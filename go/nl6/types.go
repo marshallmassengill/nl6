@@ -159,8 +159,11 @@ type DeviceSimulator struct {
 	// startup or because the device hasn't completed startGnmiServer.
 	gnmiServer   *grpc.Server
 	gnmiListener net.Listener
-	running      bool
-	mu           sync.RWMutex
+	// netconfServer is the per-device NETCONF-over-TLS listener, nil when
+	// -netconf-enable is off or the device has not started it.
+	netconfServer *netconfServer
+	running       bool
+	mu            sync.RWMutex
 }
 
 // SNMPv3 USM (User-based Security Model) configuration
@@ -725,6 +728,10 @@ type SimulatorManager struct {
 	// deletion, mirroring the flow/trap/syslog status pattern.
 	gnmiDialoutSubsystemActive atomic.Bool
 	gnmiDialoutAggregates      sync.Map // key: gnmiDialoutKey, value: *gnmiDialoutAggregate
+
+	// NETCONF over TLS (netconf_manager.go): configuration fixed at start
+	// and counters that survive device churn.
+	netconf netconfSubsystem
 
 	// DNS service-discovery subsystem. The server (dns_server.go) reads the
 	// live device map through the manager's zoneDataProvider implementation, so

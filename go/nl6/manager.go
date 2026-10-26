@@ -695,6 +695,9 @@ func (sm *SimulatorManager) Shutdown() error {
 	// its per-device gRPC server. Safe to call when never started.
 	sm.StopGnmiSubsystem()
 
+	// Stop every device's NETCONF server. Safe to call when never started.
+	sm.StopNetconfSubsystem()
+
 	// Stop the gNMI dial-out subsystem (per-device push exporters: cancel
 	// each run loop and close its ClientConn). Safe to call when never started.
 	sm.StopGnmiDialout()

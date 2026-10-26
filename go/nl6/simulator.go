@@ -165,7 +165,14 @@ func main() {
 		// gNMI flags. See CLAUDE.md "gNMI target" for detail.
 		gnmiPort    = flag.Int("gnmi-port", gnmiDefaultPort, "TCP port for the per-device gNMI dial-in listener, which serves TLS unless -gnmi-tls=false (default: 9339)")
 		gnmiDisable = flag.Bool("gnmi-disable", false, "Disable the gNMI subsystem; no device listens on the gNMI port. Default: false (subsystem on, TLS)")
-		gnmiTLS     = flag.Bool("gnmi-tls", true, "Serve gNMI dial-in over TLS with the simulator's shared self-signed cert (default: true; clients need --skip-verify). -gnmi-tls=false serves plaintext gRPC instead, for clients that dial without TLS")
+		// NETCONF over TLS (RFC 7589) with RFC 8639/8641 YANG-Push. [global],
+		// off by default: every device would otherwise gain a listener.
+		netconfEnable      = flag.Bool("netconf-enable", false, "[global] Serve NETCONF over TLS (RFC 7589) with YANG-Push (RFC 8639/8641) on every device. Default: false")
+		netconfPort        = flag.Int("netconf-port", netconfDefaultPort, "[global] TCP port for the per-device NETCONF-over-TLS listener (default: 6513)")
+		netconfTLSCert     = flag.String("netconf-tls-cert", "", "[global] PEM server certificate for NETCONF (with -netconf-tls-key). Empty = the shared self-signed certificate, regenerated at every start")
+		netconfTLSKey      = flag.String("netconf-tls-key", "", "[global] PEM private key for -netconf-tls-cert")
+		netconfTLSClientCA = flag.String("netconf-tls-client-ca", "", "[global] PEM CA bundle that client certificates must chain to. Empty = a client certificate is still required (RFC 7589) but not verified")
+		gnmiTLS            = flag.Bool("gnmi-tls", true, "Serve gNMI dial-in over TLS with the simulator's shared self-signed cert (default: true; clients need --skip-verify). -gnmi-tls=false serves plaintext gRPC instead, for clients that dial without TLS")
 
 		// gNMI dial-out (telemetry push) flags. [seed] flags apply ONLY to the
 		// auto-start batch; REST-created devices opt in via a per-device
@@ -601,6 +608,35 @@ func main() {
 		TLSDisabled: !*gnmiTLS,
 	}); err != nil {
 		log.Fatalf("Failed to initialize gNMI subsystem: %v", err)
+	}
+
+	// Start the NETCONF subsystem before any device exists, so every device
+	// created from here on binds its listener. A bad certificate or CA file
+	// is fatal here rather than a per-device failure later.
+	netconfCfg := NetconfSubsystemConfig{Enabled: *netconfEnable, Port: *netconfPort}
+	if !*netconfEnable && (*netconfTLSCert != "" || *netconfTLSKey != "" || *netconfTLSClientCA != "") {
+		log.Fatalf("netconf: -netconf-tls-cert / -netconf-tls-key / -netconf-tls-client-ca require -netconf-enable")
+	}
+	for _, f := range []struct {
+		path string
+		dst  *[]byte
+		flag string
+	}{
+		{*netconfTLSCert, &netconfCfg.CertPEM, "-netconf-tls-cert"},
+		{*netconfTLSKey, &netconfCfg.KeyPEM, "-netconf-tls-key"},
+		{*netconfTLSClientCA, &netconfCfg.ClientCAPEM, "-netconf-tls-client-ca"},
+	} {
+		if f.path == "" {
+			continue
+		}
+		b, err := os.ReadFile(f.path)
+		if err != nil {
+			log.Fatalf("netconf: %s: %v", f.flag, err)
+		}
+		*f.dst = b
+	}
+	if err := manager.StartNetconfSubsystem(netconfCfg); err != nil {
+		log.Fatalf("Failed to initialize NETCONF subsystem: %v", err)
 	}
 
 	// Start the optical SD/SF alarm evaluator unconditionally, before any

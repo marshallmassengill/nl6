@@ -1110,6 +1110,13 @@ func (d *DeviceSimulator) Start() error {
 		}
 	}
 
+	// Start the NETCONF server when -netconf-enable is on.
+	if manager != nil && manager.netconf.active.Load() {
+		if err := d.startNetconfServer(manager.netconf.port); err != nil {
+			errors = append(errors, fmt.Sprintf("NETCONF: %v", err))
+		}
+	}
+
 	// Start API server (if device has API resources)
 	if d.apiServer != nil && len(d.resources.API) > 0 {
 		if err := d.apiServer.Start(); err != nil {
@@ -1122,6 +1129,7 @@ func (d *DeviceSimulator) Start() error {
 		d.snmpServer.Stop()
 		d.sshServer.Stop()
 		d.stopGnmiServer()
+		d.stopNetconfServer()
 		if d.apiServer != nil {
 			d.apiServer.Stop()
 		}
@@ -1145,6 +1153,7 @@ func (d *DeviceSimulator) Stop() error {
 		d.sshServer == nil &&
 		d.apiServer == nil &&
 		d.gnmiServer == nil &&
+		d.netconfServer == nil &&
 		d.flowExporter == nil &&
 		d.trapExporter == nil &&
 		d.syslogExporter == nil &&
@@ -1180,6 +1189,7 @@ func (d *DeviceSimulator) Stop() error {
 	// keeps simulator-wide totals atomically in gnmiUpdatesSent /
 	// gnmiUpdatesDropped, which survive device delete by design.
 	d.stopGnmiServer()
+	d.stopNetconfServer()
 
 	if d.flowExporter != nil {
 		// Persist cumulative counters into the simulator-wide
@@ -1316,6 +1326,7 @@ func (d *DeviceSimulator) stopListenersOnly() {
 		d.apiServer.Stop()
 	}
 	d.stopGnmiServer()
+	d.stopNetconfServer()
 	if d.flowExporter != nil {
 		// Persist counters before Close (review decision D1.b). The
 		// `if !d.running` early-return above makes this single-shot.

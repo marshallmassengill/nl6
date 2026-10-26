@@ -292,6 +292,21 @@ See [gNMI dial-in reference](gnmi.md) for path coverage, subscribe semantics, an
 | `-gnmi-disable` | bool | `false` | **global** | Disable the subsystem; no device listens on the gNMI port. |
 | `-gnmi-tls` | bool | `true` | **global** | Serve dial-in over TLS with the simulator's shared self-signed certificate; clients need `--skip-verify` or `--tls-ca`. `false` serves plaintext gRPC instead. A client whose transport does not match the listener gets a completed TCP connection and no bytes. See [gNMI troubleshooting](gnmi.md#troubleshooting). |
 
+## NETCONF flags
+
+NETCONF over TLS (RFC 7589) with YANG-Push (RFC 8639/8641) is **off by default**.
+See [NETCONF over TLS and YANG-Push](netconf.md) for the served model, operations, subscriptions and limits.
+
+| Flag | Type | Default | Scope | Purpose |
+|------|------|---------|-------|---------|
+| `-netconf-enable` | bool | `false` | **global** | Serve NETCONF over TLS on every device. |
+| `-netconf-port` | int | `6513` | **global** | TCP port of the per-device NETCONF listener. |
+| `-netconf-tls-cert` | string | `""` | **global** | PEM server certificate, with `-netconf-tls-key`. Empty presents the shared self-signed certificate, which is regenerated at every start. |
+| `-netconf-tls-key` | string | `""` | **global** | PEM private key of `-netconf-tls-cert`. |
+| `-netconf-tls-client-ca` | string | `""` | **global** | PEM CA bundle that client certificates must chain to. Empty still requires a client certificate (RFC 7589 is mutual TLS) but does not verify it. |
+
+The certificate and CA flags require `-netconf-enable`. An unreadable or unparsable file is fatal at startup.
+
 ## gNMI dial-out flags
 
 Dial-out reverses the connection direction: the device dials a collector and pushes telemetry over a `gNMIReverse.Publish` stream.

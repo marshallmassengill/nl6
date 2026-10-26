@@ -69,7 +69,7 @@ WEB_DIR := go/nl6/web
 
 UNAME_S := $(shell uname -s)
 
-.PHONY: all build reconcile yang-cache gen-gnmi-catalog test-gnmi-drift gen-junos-chassis gen-xr-chassis check-capture-leak run test test-race test-web check-guard-file tidy check-tidy dist packages smoke set-nix-version set-ansible-version nix-vendor-hash check-ansible-version sbom-curate check-sbom-coverage check-ansible clean docker-build docker-push docker-up docker-down help version \
+.PHONY: all build reconcile yang-cache test-interop-netconf gen-gnmi-catalog test-gnmi-drift gen-junos-chassis gen-xr-chassis check-capture-leak run test test-race test-web check-guard-file tidy check-tidy dist packages smoke set-nix-version set-ansible-version nix-vendor-hash check-ansible-version sbom-curate check-sbom-coverage check-ansible clean docker-build docker-push docker-up docker-down help version \
         check-go check-docker check-buildx check-linux check-node check-node-runtime \
         docs-install docs-serve docs-build docs-check-orphans docs-check-csp docs-audit-overrides docs-clean \
         check-release-integrity check-release-integrity-test \
@@ -475,6 +475,28 @@ test-interop-pyroscope: check-go check-docker
 	  $(ALLOY_IMAGE) run --server.http.listen-addr=127.0.0.1:12345 /etc/alloy/config.alloy >/dev/null; \
 	sleep 2; [ "$$(docker inspect -f '{{.State.Running}}' nl6-interop-alloy 2>/dev/null)" = true ] || fail "Alloy container is not running"; \
 	( cd $(GO_DIR) && NL6_PYROSCOPE_INTEROP=1 go test ./nl6/ -run 'TestPyroscopeInterop' -count=1 -v -timeout 10m ) || fail "interop test failed"
+
+## test-interop-netconf: Check nl6's NETCONF server with libyang and netopeer2-cli (needs docker)
+##
+## Runs TestNetconfInterop: yanglint builds its schema from the YANG library
+## nl6 serves and validates every shipped profile's datastores plus live
+## replies and notifications; netopeer2-cli runs a mutual-TLS session with an
+## on-change establish-push. The notconf image carries both tools and the
+## IETF modules, except RFC 6241's ietf-netconf@2011-06-01 (it ships
+## libnetconf2's 2013-09-29 variant), which is fetched from the YangModels
+## commit the gNMI catalogue already pins and checked against its digest.
+## --network host (for netopeer2-cli) needs Linux.
+NETCONF_INTEROP_IMAGE ?= ghcr.io/notconf/notconf:debug
+NETCONF_YANG_DIR = $(YANG_CACHE)/netconf-interop
+IETF_NETCONF_SHA256 = 6c1d0b39e789b53ea13b7ea6703c2dcb199157a7b011ce30af4ca61b8ba9b13f
+test-interop-netconf: check-go check-docker
+	@mkdir -p $(NETCONF_YANG_DIR)
+	@f=$(NETCONF_YANG_DIR)/ietf-netconf@2011-06-01.yang; \
+	[ -f $$f ] || curl -fsSL -o $$f "https://raw.githubusercontent.com/YangModels/yang/$(CISCO_YANG_COMMIT)/standard/ietf/RFC/ietf-netconf%402011-06-01.yang"; \
+	echo "$(IETF_NETCONF_SHA256)  $$f" | sha256sum -c --quiet || { rm -f $$f; echo "ietf-netconf@2011-06-01.yang digest mismatch"; exit 1; }
+	docker pull -q $(NETCONF_INTEROP_IMAGE) >/dev/null
+	cd $(GO_DIR) && NL6_NETCONF_INTEROP=1 NL6_NETCONF_IMAGE=$(NETCONF_INTEROP_IMAGE) NL6_NETCONF_YANG_DIR=$(abspath $(NETCONF_YANG_DIR)) \
+	  go test ./nl6/ -run 'TestNetconfInterop' -count=1 -v -timeout 10m
 
 ## test-interop-ipfix: Decode nl6's IPFIX / NBAR2 export with a REAL IPFIXcol2 container (needs docker)
 ##
