@@ -132,7 +132,10 @@ type netconfSession struct {
 	// user and source identify the session in RFC 6470 session events: the
 	// client certificate's common name, and the peer address.
 	user, source string
-	helloDone    bool // the session-start was recorded, so an end is owed
+	helloDone    bool // the session-start was recorded, so an end is owed; under endMu
+	// callHome marks a session on a connection the device dialled (RFC
+	// 8071); the configured subscriptions are delivered on it.
+	callHome bool
 
 	// endReason and killedBy describe how the session ended, for its
 	// netconf-session-end. Written before close runs, read inside it.
@@ -171,8 +174,20 @@ func (s *netconfSession) run() {
 		s.srv.mgr.netconf.logFirstHelloError(s.srv.dev, err)
 		return
 	}
+	// Under endMu, which close reads helloDone under: a stop racing the
+	// hello either sees the start recorded, and records the end, or ends
+	// the session before the start is recorded at all.
+	s.endMu.Lock()
+	if s.isClosed() {
+		s.endMu.Unlock()
+		return
+	}
 	s.helloDone = true
 	s.srv.events.sessionEvent(netconfEvent{kind: netconfEventSessionStart, sessionID: s.id, user: s.user, source: s.source})
+	s.endMu.Unlock()
+	if s.callHome && !s.startConfigured() {
+		return
+	}
 	for {
 		msg, err := s.rd.ReadMessage()
 		if err != nil {
@@ -287,10 +302,10 @@ func (s *netconfSession) close() {
 			sub.stop()
 		}
 		s.srv.removeSession(s)
-		if s.helloDone {
-			s.endMu.Lock()
-			reason, killer := s.endReason, s.killedBy
-			s.endMu.Unlock()
+		s.endMu.Lock()
+		started, reason, killer := s.helloDone, s.endReason, s.killedBy
+		s.endMu.Unlock()
+		if started {
 			if reason == "" {
 				reason = "dropped"
 			}

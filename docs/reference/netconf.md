@@ -4,6 +4,7 @@ With `-netconf-enable`, every simulated device runs a NETCONF server over TLS ([
 It serves `ietf-interfaces` ([RFC 8343](https://www.rfc-editor.org/rfc/rfc8343)) and pushes it to subscribers with YANG-Push ([RFC 8639](https://www.rfc-editor.org/rfc/rfc8639) / [RFC 8641](https://www.rfc-editor.org/rfc/rfc8641)), both periodically and on change.
 It also publishes the `NETCONF` event stream, carrying `ietf-alarms` ([RFC 8632](https://www.rfc-editor.org/rfc/rfc8632)) link alarms and [RFC 6470](https://www.rfc-editor.org/rfc/rfc6470) session events, with replay.
 That stream can be subscribed to through RFC 8639 or [RFC 5277](https://www.rfc-editor.org/rfc/rfc5277).
+With `-netconf-callhome`, every device also dials a collector with NETCONF Call Home over TLS ([RFC 8071](https://www.rfc-editor.org/rfc/rfc8071)), optionally carrying configured subscriptions.
 
 Values come from the same interface state engine and counter cycler that serve SNMP and gNMI.
 A link flap caused through the REST API or the flap scheduler therefore appears in `ifOperStatus`, in gNMI ON_CHANGE, in link traps, as a NETCONF `push-change-update`, and as an `alarm-notification`.
@@ -21,8 +22,10 @@ The subsystem is **off by default**: enabling it adds a listener to every device
 | `-netconf-tls-cert` | (shared cert) | PEM server certificate. Requires `-netconf-tls-key`. |
 | `-netconf-tls-key` | | PEM private key of `-netconf-tls-cert`. |
 | `-netconf-tls-client-ca` | (none) | PEM CA bundle that client certificates must chain to. |
+| `-netconf-callhome` | (off) | Call Home client every device dials, as `host` or `host:port`; the port defaults to 4335. See [Call Home](#call-home). |
+| `-netconf-callhome-subscriptions` | (none) | Configured subscriptions sent on each Call Home session. Requires `-netconf-callhome`. |
 
-The certificate and CA flags require `-netconf-enable`; given without it they are refused at startup.
+The certificate, CA and Call Home flags require `-netconf-enable`; given without it they are refused at startup.
 A file that cannot be read or parsed is fatal at startup rather than a failure on every device later.
 
 ## TLS
@@ -41,7 +44,10 @@ Every device presents the same certificate either way.
 A client that checks the host name, such as netopeer2-cli, therefore needs a certificate whose SANs cover every device address it dials.
 The OpenNMS connector's `ca` policy does not check host names.
 
-`GET /api/v1/netconf/status` reports the presented certificate's SHA-256 fingerprint as `server_cert_sha256`, in the colon-separated hex form OpenSSL prints.
+`GET /api/v1/netconf/status` reports the presented certificate's SHA-256 fingerprint twice:
+
+- `server_cert_sha256`, in the colon-separated hex form OpenSSL prints;
+- `server_cert_fingerprint`, as `SHA256:<base64>`, the form OpenSSH prints and OpenNMS's Call Home listener logs and compares.
 
 The username RFC 7589 derives from a client certificate is not used, because nothing on the server is access-controlled.
 
@@ -258,6 +264,39 @@ The replay buffer holds the last 256 records per device.
 `/streams` reports `replay-log-creation-time` (when the device started) and, once records have aged out, `replay-log-aged-time`.
 A subscription's queue holds 64 records; when it is full, the oldest is dropped and counted in `stream_records_dropped`.
 
+## Call Home
+
+With `-netconf-callhome`, every device dials the given client with NETCONF Call Home over TLS (RFC 8071 §4.1):
+
+- The device connects from its own address, so a collector can identify it by the source of the connection.
+- Once the TCP connection is up, the roles are those of an ordinary session. The device is the TLS server and the NETCONF server: it presents its server certificate, requires the client's certificate as `-netconf-tls-client-ca` dictates, and serves every operation the listener does.
+- The connection is persistent. When it ends or a dial fails, the device dials again after a backoff that starts at 1 s and doubles up to 30 s. Each wait is randomised between half and all of the backoff, so a fleet whose client restarted does not redial in lockstep. A session that lasted at least 30 s resets the backoff.
+- The per-device listener keeps running alongside, on `-netconf-port`.
+
+A failed TLS handshake on a Call Home connection is counted in `tls_handshake_failures`, like one on the listener.
+A handshake cut short because the device is stopping is not counted.
+
+### Configured subscriptions
+
+`-netconf-callhome-subscriptions` is a comma-separated list of configured subscriptions ([RFC 8639 §2.5](https://www.rfc-editor.org/rfc/rfc8639#section-2.5)), up to 8:
+
+| Entry | Subscription |
+|-------|--------------|
+| `stream` | The `NETCONF` event stream, unfiltered. |
+| `on-change` | `/ietf-interfaces:interfaces` of the operational datastore, on change, with `sync-on-start`. |
+| `periodic=<duration>` | `/ietf-interfaces:interfaces` of the operational datastore, every `<duration>` (at least 1 s, in whole centiseconds). |
+
+For example, `-netconf-callhome-subscriptions stream,on-change,periodic=30s`.
+
+- Ids are assigned from 1 in list order, so an entry has the same id on every device and across restarts. Dynamic subscriptions are numbered from 100, so the two never collide.
+- The Call Home client is the subscriptions' one receiver, named `call-home`. Each Call Home session opens with a `subscription-started` per subscription, before any of its records.
+- While no Call Home session is up, the receiver's state is `connecting`. Records produced meanwhile are not replayed to it.
+- `delete-subscription` cannot remove a configured subscription (`no-such-subscription`), and configured subscriptions do not count against the per-session cap.
+- `/subscriptions` lists them in the operational datastore, with `configured-subscription-state valid` and the receiver's `sent-event-records` and `state`. The running datastore lists the configuration without the state.
+- Their `transport` leaf is left out. No published module defines a transport identity for NETCONF, and YANG does not require the leaf.
+- The `ietf-subscribed-notifications` feature `configured` is claimed whether or not any are set. Here, configuration means nl6's flags, the way a device's configuration would mean its CLI.
+- Sessions on the listener receive none of this: they get only what they subscribe to.
+
 ## Limits
 
 | Limit | Value | What happens at the limit |
@@ -284,6 +323,7 @@ Like gNMI dial-in SAMPLE, a periodic subscription is requested by the collector,
   "port": 6513,
   "client_auth": "any-certificate",
   "server_cert_sha256": "9A:8C:...:AE",
+  "server_cert_fingerprint": "SHA256:mowB...",
   "listeners": 100,
   "sessions_active": 2,
   "sessions_total": 5,
@@ -298,9 +338,23 @@ Like gNMI dial-in SAMPLE, a periodic subscription is requested by the collector,
   "push_change_updates": 7,
   "event_notifications": 12,
   "stream_records_dropped": 0,
-  "notification_write_failures": 0
+  "notification_write_failures": 0,
+  "callhome": "collector.example:4335",
+  "configured_subscriptions": ["stream", "on-change"],
+  "callhome_connected": 100,
+  "callhome_dials": 104,
+  "callhome_dial_failures": 4,
+  "callhome_sessions_total": 100
 }
 ```
+
+The `callhome` fields are present only with `-netconf-callhome`:
+
+- `callhome_connected` counts the Call Home connections up now, including those still in their handshake.
+- `callhome_dials` counts every dial attempt, and `callhome_dial_failures` those that did not connect.
+- `callhome_sessions_total` counts the Call Home sessions that got past the handshake.
+
+Call Home sessions are counted in `sessions_active` and `sessions_total` too.
 
 The counters are cumulative and survive device deletion.
 The first failed TLS handshake and the first failed hello are logged.
@@ -340,6 +394,28 @@ The `auto` mode also picks RFC 8639: it reads `ietf-subscribed-notifications` fr
 - `ietf-alarms` and `ietf-netconf-notifications` are IETF namespaces, so the adapter names them without uploading a module.
   `nl6-alarm-types` appears only as the `alarm-type-id` parameter value. You can upload it from `get-schema` or `go/nl6/netconf_yang/` if you want it in the YANG Modules registry.
 
+### Call Home
+
+OpenNMS's NETCONF Call Home listener accepts TLS with `transport` set to `tls`, on port 4335 by default.
+Point nl6 at it with `-netconf-callhome <opennms-host>`.
+
+```xml
+<listener name="NETCONF-CallHome-TLS" class-name="org.opennms.netmgt.telemetry.protocols.netconf.listener.NetconfCallHomeListener" enabled="true">
+    <parameter key="transport" value="tls"/>
+    <parameter key="clientCertificatePath" value="/opt/opennms/etc/netconf/tls/client.pem"/>
+    <parameter key="privateKeyPath" value="/opt/opennms/etc/netconf/tls/client.key"/>
+    <parser name="NETCONF-CallHome-TLS-Parser" class-name="org.opennms.netmgt.telemetry.protocols.netconf.listener.NetconfCallHomeParser" queue="NETCONF"/>
+</listener>
+```
+
+- The listener accepts a caller whose source address belongs to a node, or whose fingerprint is in `allowedFingerprints`.
+  - nl6 devices dial from their own addresses, so provisioned nodes match by address.
+  - Without nodes, set `allowedFingerprints` to `server_cert_fingerprint` from the status endpoint. Every device presents the same certificate, so one value admits the fleet. The listener compares the `SHA256:<base64>` form exactly, so the colon-hex `server_cert_sha256` does not match.
+- With the listener's default `acceptConfigured=true` and no `stream`, `datastore` or filter, it establishes no subscription of its own and forwards what the device's configured subscriptions send. Run nl6 with `-netconf-callhome-subscriptions` in that case, or it sends nothing.
+  - Records of a configured `stream` subscription carry no subscription id, so the forwarder classifies them as event-stream notifications.
+  - `subscription-started` is forwarded as an event-stream notification too.
+- With `xpathFilter=/ietf-alarms:alarm-notification` (or another subscription parameter), the listener establishes a dynamic subscription on the Call Home session, as the connector does on a dialled one. Configured subscriptions still flow alongside, so a configured `stream` delivers each alarm twice.
+
 ## Verification
 
 `make test-interop-netconf` checks nl6 against independent implementations, using the `ghcr.io/notconf/notconf:debug` image:
@@ -351,12 +427,17 @@ The `auto` mode also picks RFC 8639: it reads `ietf-subscribed-notifications` fr
   - `push-update`, `push-change-update`, `alarm-notification`, `netconf-session-start`, `netconf-session-end`, `replay-completed`, `subscription-terminated`, `replayComplete`, and `notificationComplete`.
 - `netopeer2-cli` runs a mutual-TLS session against the real listener with no local copy of nl6's extra modules, so it must resolve them through `get-schema`.
 - In that session it runs `get-data`, then an on-change `establish-push` and an `establish-sub` on the `NETCONF` stream. Both must deliver a link flap, and no request may draw an rpc-error.
+- `netopeer2-cli listen --tls` takes a Call Home session from a device with a configured `stream` subscription. It must receive `subscription-started`, answer `get-data`, establish its own stream subscription and receive the alarm of a link flap, with no rpc-error.
+- yanglint also validates the Call Home documents: each `subscription-started`, the configured subscriptions' records, and `/subscriptions` in both datastores.
 
 ## Not implemented
 
-- NETCONF over SSH (RFC 6242) and Call Home (RFC 8071).
+- NETCONF over SSH (RFC 6242), and Call Home over SSH.
+- More than one Call Home client, or the RFC 8071 periodic connection type. The connection is persistent.
 - Event streams other than `NETCONF`, and notifications other than link alarms and session events.
-- Configured subscriptions, `modify-subscription`, `kill-subscription` and `resync-subscription`.
+- Configured subscriptions beyond the three `-netconf-callhome-subscriptions` kinds, configuring them over NETCONF, their replay, and the subscription-state notifications other than `subscription-started`.
+- `modify-subscription`, `kill-subscription` and `resync-subscription`.
+- Dynamic subscriptions in `/subscriptions`.
 - Alarm operator actions, shelving, history, and purge.
 - Writable datastores and NACM.
 - The OpenConfig models gNMI serves. NETCONF serves the IETF interface model only.

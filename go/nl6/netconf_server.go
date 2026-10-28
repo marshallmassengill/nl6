@@ -45,6 +45,12 @@ type netconfServer struct {
 	events *netconfEventLog
 
 	view atomic.Pointer[netconfIfaces]
+
+	// callHome is the device's RFC 8071 dial loop, nil when Call Home is
+	// off. configured holds the configured subscriptions' per-device
+	// state, which outlives any one Call Home session.
+	callHome   *netconfCallHome
+	configured []*netconfConfiguredState
 }
 
 // startNetconfServer binds the device's listener, inside its netns when it
@@ -71,6 +77,9 @@ func (d *DeviceSimulator) startNetconfServer(port int) error {
 	d.netconfServer = srv
 	srv.wg.Add(1)
 	go srv.acceptLoop()
+	if mgr.netconf.callHome != "" {
+		srv.startCallHome(mgr.netconf.callHome)
+	}
 	return nil
 }
 
@@ -91,6 +100,9 @@ func (d *DeviceSimulator) stopNetconfServer() {
 	}
 	srv.mu.Unlock()
 	_ = srv.ln.Close()
+	if srv.callHome != nil {
+		srv.callHome.cancel() // ends a dial, a backoff wait or a handshake in progress
+	}
 	for _, s := range sessions {
 		s.closeWith("other", 0) // RFC 6470: the server ended it
 	}
@@ -132,27 +144,41 @@ func (srv *netconfServer) acceptLoop() {
 	}
 }
 
-// serveConn runs the TLS handshake and then the session.
+// serveConn runs an accepted connection: the TLS handshake, then the
+// session.
 func (srv *netconfServer) serveConn(raw net.Conn) {
 	defer srv.wg.Done()
 	defer srv.conns.Add(-1)
+	srv.serveTLS(raw, false)
+}
+
+// serveTLS is the server side of RFC 7589 on raw, which the device either
+// accepted or dialled for Call Home: in both the device is the TLS server
+// (RFC 8071 §4.1). It returns when the session ends, and reports whether
+// one ran, so a Call Home caller can tell a refused handshake from a
+// session that ended.
+func (srv *netconfServer) serveTLS(raw net.Conn, callHome bool) bool {
 	nc := &srv.mgr.netconf
 	conn := tls.Server(raw, nc.tlsConfig)
 	_ = conn.SetDeadline(time.Now().Add(netconfHelloTimeout))
 	if err := conn.Handshake(); err != nil {
+		_ = conn.Close()
+		if srv.isClosed() {
+			return false // the device stopping cut it short: not the client's failure
+		}
 		nc.tlsHandshakeFailures.Add(1)
 		nc.logFirstHandshakeError(srv.dev, raw.RemoteAddr(), err)
-		_ = conn.Close()
-		return
+		return false
 	}
 	_ = conn.SetDeadline(time.Time{})
 	s := &netconfSession{
-		id:   nc.nextSessionID.Add(1),
-		srv:  srv,
-		conn: conn,
-		rd:   newNetconfReader(conn, netconfMaxMessageBytes),
-		subs: map[uint32]*netconfSubscription{},
-		done: make(chan struct{}),
+		id:       nc.nextSessionID.Add(1),
+		srv:      srv,
+		conn:     conn,
+		rd:       newNetconfReader(conn, netconfMaxMessageBytes),
+		subs:     map[uint32]*netconfSubscription{},
+		done:     make(chan struct{}),
+		callHome: callHome,
 	}
 	if cs := conn.ConnectionState(); len(cs.PeerCertificates) > 0 {
 		s.user = cs.PeerCertificates[0].Subject.CommonName
@@ -167,13 +193,20 @@ func (srv *netconfServer) serveConn(raw net.Conn) {
 	if srv.closed {
 		srv.mu.Unlock()
 		_ = conn.Close()
-		return
+		return false
 	}
 	srv.sessions[s.id] = s
 	srv.mu.Unlock()
 	nc.sessionsActive.Add(1)
 	nc.sessionsTotal.Add(1)
 	s.run()
+	return true
+}
+
+func (srv *netconfServer) isClosed() bool {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return srv.closed
 }
 
 func (srv *netconfServer) removeSession(s *netconfSession) {
@@ -257,6 +290,9 @@ func (srv *netconfServer) datastore(ds netconfDatastoreName, now time.Time) []*n
 		if srv.events != nil {
 			out = append(out, srv.events.alarmsNode(), srv.events.streamsNode(), srv.events.netconfStreamsNode())
 		}
+	}
+	if n := srv.subscriptionsNode(ds == netconfRunning); n != nil {
+		out = append(out, n)
 	}
 	return out
 }

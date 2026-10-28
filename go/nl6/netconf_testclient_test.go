@@ -162,6 +162,13 @@ func dialTestNetconf(t *testing.T, addr string, cert *tls.Certificate, base11 bo
 	if err != nil {
 		return nil, err
 	}
+	return helloTestNetconf(t, conn, base11)
+}
+
+// helloTestNetconf runs the client side of the hello exchange on conn,
+// which may have been accepted from a device calling home.
+func helloTestNetconf(t *testing.T, conn *tls.Conn, base11 bool) (*ncTestClient, error) {
+	t.Helper()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	c := &ncTestClient{t: t, conn: conn, rd: newNetconfReader(conn, 16<<20)}
 	msg, err := c.rd.ReadMessage()

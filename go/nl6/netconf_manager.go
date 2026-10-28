@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -44,6 +45,15 @@ type NetconfSubsystemConfig struct {
 	// a client certificate is ALWAYS required; without a CA any
 	// certificate is accepted, which status reports as any-certificate.
 	ClientCAPEM []byte
+	// CallHome is the RFC 8071 Call Home client every device dials, as
+	// host or host:port (port 4335 when omitted); empty means no device
+	// calls home. The TLS identity and client verification are the ones
+	// above: after the TCP connection the device is still the TLS server.
+	CallHome string
+	// CallHomeSubscriptions are the configured subscriptions (RFC 8639
+	// §2.5) delivered over each Call Home session, in the syntax of
+	// parseNetconfConfiguredSubscriptions. They need CallHome.
+	CallHomeSubscriptions string
 }
 
 // netconfSubsystem is the manager's NETCONF state: configuration fixed at
@@ -54,6 +64,9 @@ type netconfSubsystem struct {
 	tlsConfig  *tls.Config
 	clientAuth string
 	certSHA256 string
+	certPrint  string // SHA256:<base64>
+	callHome   string // host:port, empty when off
+	configured []netconfConfiguredSubscription
 
 	nextSessionID      atomic.Uint32
 	nextSubscriptionID atomic.Uint32
@@ -73,8 +86,14 @@ type netconfSubsystem struct {
 	streamRecordsDropped      atomic.Uint64
 	notificationWriteFailures atomic.Uint64
 
+	callHomeDials         atomic.Uint64
+	callHomeDialFailures  atomic.Uint64
+	callHomeSessionsTotal atomic.Uint64
+	callHomeConnected     atomic.Int64
+
 	firstHandshakeErr sync.Once
 	firstHelloErr     sync.Once
+	firstCallHomeErr  sync.Once
 }
 
 // NetconfStatus is the body of GET /api/v1/netconf/status.
@@ -84,7 +103,11 @@ type NetconfStatus struct {
 	ClientAuth      string `json:"client_auth,omitempty"`
 	// ServerCertSHA256 is the leaf certificate's fingerprint in the colon
 	// hex form OpenSSL prints, for a collector that pins by fingerprint.
-	ServerCertSHA256       string `json:"server_cert_sha256,omitempty"`
+	ServerCertSHA256 string `json:"server_cert_sha256,omitempty"`
+	// ServerCertFingerprint is the same digest as SHA256:<base64>, without
+	// padding: the form OpenSSH prints and OpenNMS's Call Home listener
+	// logs and matches in allowedFingerprints.
+	ServerCertFingerprint  string `json:"server_cert_fingerprint,omitempty"`
 	Listeners              int    `json:"listeners"`
 	SessionsActive         int64  `json:"sessions_active"`
 	SessionsTotal          uint64 `json:"sessions_total"`
@@ -102,6 +125,14 @@ type NetconfStatus struct {
 	EventNotifications        uint64 `json:"event_notifications"`
 	StreamRecordsDropped      uint64 `json:"stream_records_dropped"`
 	NotificationWriteFailures uint64 `json:"notification_write_failures"`
+	// CallHome is the Call Home client devices dial; the counters below
+	// it are present only when it is set.
+	CallHome                string   `json:"callhome,omitempty"`
+	ConfiguredSubscriptions []string `json:"configured_subscriptions,omitempty"`
+	CallHomeConnected       *int64   `json:"callhome_connected,omitempty"`
+	CallHomeDials           *uint64  `json:"callhome_dials,omitempty"`
+	CallHomeDialFailures    *uint64  `json:"callhome_dial_failures,omitempty"`
+	CallHomeSessionsTotal   *uint64  `json:"callhome_sessions_total,omitempty"`
 }
 
 // StartNetconfSubsystem validates cfg and records it. With Enabled false it
@@ -151,6 +182,20 @@ func (sm *SimulatorManager) StartNetconfSubsystem(cfg NetconfSubsystemConfig) er
 		tc.ClientAuth = tls.RequireAndVerifyClientCert
 		nc.clientAuth = netconfClientAuthVerified
 	}
+	if cfg.CallHome == "" && cfg.CallHomeSubscriptions != "" {
+		return fmt.Errorf("netconf: -netconf-callhome-subscriptions needs -netconf-callhome: configured subscriptions are delivered over Call Home")
+	}
+	if cfg.CallHome != "" {
+		ch, err := netconfCallHomeAddress(cfg.CallHome)
+		if err != nil {
+			return err
+		}
+		subs, err := parseNetconfConfiguredSubscriptions(cfg.CallHomeSubscriptions)
+		if err != nil {
+			return err
+		}
+		nc.callHome, nc.configured = ch, subs
+	}
 	nc.tlsConfig = tc
 	nc.port = port
 	if len(cert.Certificate) > 0 {
@@ -160,6 +205,7 @@ func (sm *SimulatorManager) StartNetconfSubsystem(cfg NetconfSubsystemConfig) er
 			hexes[i] = fmt.Sprintf("%02X", b)
 		}
 		nc.certSHA256 = strings.Join(hexes, ":")
+		nc.certPrint = "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:])
 	}
 	nc.active.Store(true)
 	if nc.clientAuth == netconfClientAuthAny {
@@ -168,6 +214,10 @@ func (sm *SimulatorManager) StartNetconfSubsystem(cfg NetconfSubsystemConfig) er
 	} else {
 		log.Printf("NETCONF subsystem enabled on port %d (TLS, RFC 7589); client certificates verified against "+
 			"-netconf-tls-client-ca. Server certificate SHA-256 %s", port, nc.certSHA256)
+	}
+	if nc.callHome != "" {
+		log.Printf("NETCONF Call Home over TLS (RFC 8071) to %s from every device, %d configured subscription(s)",
+			nc.callHome, len(nc.configured))
 	}
 	return nil
 }
@@ -234,6 +284,16 @@ func (sm *SimulatorManager) GetNetconfStatus() NetconfStatus {
 	st.Port = nc.port
 	st.ClientAuth = nc.clientAuth
 	st.ServerCertSHA256 = nc.certSHA256
+	st.ServerCertFingerprint = nc.certPrint
+	if nc.callHome != "" {
+		st.CallHome = nc.callHome
+		for _, c := range nc.configured {
+			st.ConfiguredSubscriptions = append(st.ConfiguredSubscriptions, c.String())
+		}
+		connected, dials, failures, total := nc.callHomeConnected.Load(), nc.callHomeDials.Load(),
+			nc.callHomeDialFailures.Load(), nc.callHomeSessionsTotal.Load()
+		st.CallHomeConnected, st.CallHomeDials, st.CallHomeDialFailures, st.CallHomeSessionsTotal = &connected, &dials, &failures, &total
+	}
 	sm.mu.RLock()
 	for _, d := range sm.devices {
 		d.mu.RLock()

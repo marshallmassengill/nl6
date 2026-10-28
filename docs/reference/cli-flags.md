@@ -304,8 +304,10 @@ See [NETCONF over TLS and YANG-Push](netconf.md) for the served model, operation
 | `-netconf-tls-cert` | string | `""` | **global** | PEM server certificate, with `-netconf-tls-key`. Empty presents the shared self-signed certificate, which is regenerated at every start. |
 | `-netconf-tls-key` | string | `""` | **global** | PEM private key of `-netconf-tls-cert`. |
 | `-netconf-tls-client-ca` | string | `""` | **global** | PEM CA bundle that client certificates must chain to. Empty still requires a client certificate (RFC 7589 is mutual TLS) but does not verify it. |
+| `-netconf-callhome` | string | `""` | **global** | NETCONF Call Home over TLS (RFC 8071): every device dials this `host` or `host:port` (port 4335 when omitted) from its own address and serves NETCONF on the connection, redialling when it ends. Empty is off. |
+| `-netconf-callhome-subscriptions` | string | `""` | **global** | Configured subscriptions (RFC 8639) sent on each Call Home session, comma-separated: `stream`, `on-change`, `periodic=<duration>`. Ids are 1 onwards in list order. Requires `-netconf-callhome`. |
 
-The certificate and CA flags require `-netconf-enable`. An unreadable or unparsable file is fatal at startup.
+The certificate, CA and Call Home flags require `-netconf-enable`. An unreadable or unparsable file, an invalid Call Home address and an invalid subscription list are fatal at startup.
 
 ## gNMI dial-out flags
 

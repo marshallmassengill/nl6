@@ -172,6 +172,8 @@ func main() {
 		netconfTLSCert     = flag.String("netconf-tls-cert", "", "[global] PEM server certificate for NETCONF (with -netconf-tls-key). Empty = the shared self-signed certificate, regenerated at every start")
 		netconfTLSKey      = flag.String("netconf-tls-key", "", "[global] PEM private key for -netconf-tls-cert")
 		netconfTLSClientCA = flag.String("netconf-tls-client-ca", "", "[global] PEM CA bundle that client certificates must chain to. Empty = a client certificate is still required (RFC 7589) but not verified")
+		netconfCallHome    = flag.String("netconf-callhome", "", "[global] NETCONF Call Home over TLS (RFC 8071): every device dials this host[:port] (default port 4335) from its own address and serves NETCONF on the connection, redialling when it ends. Empty = off")
+		netconfCallHomeSub = flag.String("netconf-callhome-subscriptions", "", "[global] Configured subscriptions (RFC 8639) sent on each Call Home session, comma-separated: stream (the NETCONF event stream), on-change, periodic=<duration> (both /ietf-interfaces:interfaces). Ids are 1.. in list order. Requires -netconf-callhome")
 		gnmiTLS            = flag.Bool("gnmi-tls", true, "Serve gNMI dial-in over TLS with the simulator's shared self-signed cert (default: true; clients need --skip-verify). -gnmi-tls=false serves plaintext gRPC instead, for clients that dial without TLS")
 
 		// gNMI dial-out (telemetry push) flags. [seed] flags apply ONLY to the
@@ -613,9 +615,12 @@ func main() {
 	// Start the NETCONF subsystem before any device exists, so every device
 	// created from here on binds its listener. A bad certificate or CA file
 	// is fatal here rather than a per-device failure later.
-	netconfCfg := NetconfSubsystemConfig{Enabled: *netconfEnable, Port: *netconfPort}
-	if !*netconfEnable && (*netconfTLSCert != "" || *netconfTLSKey != "" || *netconfTLSClientCA != "") {
-		log.Fatalf("netconf: -netconf-tls-cert / -netconf-tls-key / -netconf-tls-client-ca require -netconf-enable")
+	netconfCfg := NetconfSubsystemConfig{Enabled: *netconfEnable, Port: *netconfPort,
+		CallHome: *netconfCallHome, CallHomeSubscriptions: *netconfCallHomeSub}
+	if !*netconfEnable && (*netconfTLSCert != "" || *netconfTLSKey != "" || *netconfTLSClientCA != "" ||
+		*netconfCallHome != "" || *netconfCallHomeSub != "") {
+		log.Fatalf("netconf: -netconf-tls-cert / -netconf-tls-key / -netconf-tls-client-ca / -netconf-callhome / " +
+			"-netconf-callhome-subscriptions require -netconf-enable")
 	}
 	for _, f := range []struct {
 		path string

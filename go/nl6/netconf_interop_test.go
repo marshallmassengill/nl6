@@ -31,7 +31,10 @@ import (
 //     their NETCONF envelopes;
 //   - netopeer2-cli runs a whole RFC 7589 session against the real
 //     listener with mutual TLS: get-data, then an on-change establish-push
-//     that must deliver the link flap the test causes.
+//     that must deliver the link flap the test causes;
+//   - netopeer2-cli then listens for RFC 8071 Call Home over TLS and takes
+//     a session from a device with a configured subscription, whose
+//     subscription-started and records yanglint has validated too.
 //
 // Run through `make test-interop-netconf`. yanglint searches nl6's own
 // embedded modules (netconf_yang/) and nothing else, so it checks exactly
@@ -197,6 +200,56 @@ func TestNetconfInterop(t *testing.T) {
 		}
 	})
 
+	// Call Home with configured subscriptions, from a second device. The
+	// documents join the yanglint run; the device's address is fixed before
+	// it starts, so its collector port is reserved first.
+	chCol := newTestCallHomeCollector(t)
+	_, chDev, _ := startTestNetconfWith(t, 2, NetconfSubsystemConfig{
+		CertPEM: serverCert, KeyPEM: serverKey, ClientCAPEM: pki.caPEM,
+		CallHome: chCol.addr(), CallHomeSubscriptions: "stream,on-change,periodic=1s",
+	}, func(d *DeviceSimulator) {
+		st := d.metricsCycler.ifCounters.Load().State()
+		st.SetLinkState(1, OperUp)
+		st.SetLinkState(2, OperUp)
+	})
+
+	t.Run("collect Call Home documents", func(t *testing.T) {
+		c := chCol.session(t, &client)
+		n := 0
+		doc := func(kind, raw, args string) {
+			n++
+			name := fmt.Sprintf("callhome-%s-%d.xml", kind, n)
+			write(name, raw)
+			check(name, args+" /w/"+name)
+		}
+		// subscription-started for each, plus the first records.
+		seen := map[string]bool{}
+		for len(seen) < 3 {
+			el, raw := c.next(5 * time.Second)
+			doc("notif", raw, "-t nc-notif")
+			if started := el.Child(nsSubscribedNotif, "subscription-started"); started != nil {
+				seen[childText(started, nsSubscribedNotif, "id")] = true
+			}
+		}
+		setLink(t, chDev, 1, OperDown)
+		for got := map[string]bool{}; !got["alarm-notification"] || !got["push-change-update"]; {
+			el, raw := c.next(5 * time.Second)
+			doc("notif", raw, "-t nc-notif")
+			got[el.Children[1].Local] = true
+		}
+		for _, op := range []string{
+			`<get><filter type="subtree"><subscriptions xmlns="` + nsSubscribedNotif + `"/></filter></get>`,
+			`<get-config><source><running/></source></get-config>`,
+		} {
+			reply, raw := c.rpc(op)
+			mustNoRPCError(t, reply, raw)
+			n++
+			write(fmt.Sprintf("callhome-rpc-%d.xml", n), fmt.Sprintf(`<rpc xmlns="%s" message-id="%d">%s</rpc>`, nsNetconfBase, c.msgID, op))
+			doc("reply", raw, fmt.Sprintf("-t nc-reply -R /w/callhome-rpc-%d.xml", n))
+		}
+		_ = c.conn.Close()
+	})
+
 	t.Run("yanglint", func(t *testing.T) {
 		// Zero documents passes yanglint trivially, which is what running
 		// this subtest alone (-run .../yanglint) used to do.
@@ -263,6 +316,70 @@ func TestNetconfInterop(t *testing.T) {
 		}
 		for _, want := range []string{"<oper-status", ">up</oper-status>", "push-change-update", "interface=Gi0%2F1/oper-status",
 			"<alarm-notification", "nl6-at:link-down", "<perceived-severity>major</perceived-severity>"} {
+			if !strings.Contains(r.out, want) {
+				t.Errorf("netopeer2-cli output lacks %q:\n%s", want, tail(r.out, 60))
+			}
+		}
+		for _, bad := range []string{"ERROR", "nc_err", "libyang["} {
+			if strings.Contains(r.out, bad) {
+				t.Errorf("netopeer2-cli reported %q:\n%s", bad, tail(r.out, 60))
+			}
+		}
+	})
+
+	t.Run("netopeer2-cli Call Home", func(t *testing.T) {
+		// netopeer2-cli listens; a third device calls it. The device starts
+		// after the listener is up, so its first redials are seconds apart.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		write("chfilter.xml", `<interfaces xmlns="`+nsIETFInterfaces+`"><interface><name>TestIf1</name><oper-status/></interface></interfaces>`)
+		cmds := fmt.Sprintf("listen --tls --timeout 30 --port %d --cert /w/client.pem --key /w/client.key --trusted /w/ca.pem --peername 127.0.0.1\n"+
+			"get-data --datastore operational --filter-subtree=/w/chfilter.xml\n"+
+			"establish-sub --stream NETCONF --filter-xpath /ietf-alarms:alarm-notification\n", port)
+		type result struct {
+			out string
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			out, err := docker(t, "host", "", "--entrypoint", "sh", image, "-c",
+				fmt.Sprintf("(printf '%%b' %q; sleep 8; printf 'disconnect\\nquit\\n') | netopeer2-cli", cmds))
+			done <- result{out, err}
+		}()
+		time.Sleep(2 * time.Second) // container start
+		mgr3, dev3, _ := startTestNetconfWith(t, 2, NetconfSubsystemConfig{
+			CertPEM: serverCert, KeyPEM: serverKey, ClientCAPEM: pki.caPEM,
+			CallHome: fmt.Sprintf("127.0.0.1:%d", port), CallHomeSubscriptions: "stream",
+		}, func(d *DeviceSimulator) {
+			st := d.metricsCycler.ifCounters.Load().State()
+			st.SetLinkState(1, OperUp)
+			st.SetLinkState(2, OperUp)
+		})
+		deadline := time.Now().Add(25 * time.Second)
+		for mgr3.netconf.subscriptionsActive.Load() < 2 { // the configured one and establish-sub
+			if time.Now().After(deadline) {
+				r := <-done
+				t.Fatalf("netopeer2-cli never established a subscription over Call Home: %v\n%s", r.err, tail(r.out, 60))
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		setLink(t, dev3, 1, OperDown)
+		r := <-done
+		if r.err != nil {
+			t.Fatalf("netopeer2-cli: %v\n%s", r.err, tail(r.out, 60))
+		}
+		t.Logf("netopeer2-cli output:\n%s", tail(r.out, 80))
+		if n := mgr3.netconf.rpcErrors.Load(); n != 0 {
+			t.Errorf("nl6 answered %d of netopeer2-cli's requests with rpc-error:\n%s", n, tail(r.out, 60))
+		}
+		if mgr3.netconf.callHomeSessionsTotal.Load() == 0 && mgr3.netconf.callHomeConnected.Load() == 0 {
+			t.Errorf("no Call Home session ran")
+		}
+		for _, want := range []string{">up</oper-status>", "<alarm-notification", "nl6-at:link-down"} {
 			if !strings.Contains(r.out, want) {
 				t.Errorf("netopeer2-cli output lacks %q:\n%s", want, tail(r.out, 60))
 			}

@@ -46,7 +46,7 @@ var netconfModules = []netconfModule{
 	{Name: "ietf-datastores", Revision: "2018-02-14", Namespace: nsDatastores},
 	{Name: "ietf-netconf", Revision: "2011-06-01", Namespace: nsNetconfBase, YANG10: true},
 	{Name: "ietf-netconf-nmda", Revision: "2019-01-07", Namespace: nsNetconfNMDA},
-	{Name: "ietf-subscribed-notifications", Revision: "2019-09-09", Namespace: nsSubscribedNotif, Features: []string{"encode-xml", "replay", "subtree", "xpath"}},
+	{Name: "ietf-subscribed-notifications", Revision: "2019-09-09", Namespace: nsSubscribedNotif, Features: []string{"configured", "encode-xml", "replay", "subtree", "xpath"}},
 	{Name: "ietf-yang-push", Revision: "2019-09-09", Namespace: nsYangPush, Features: []string{"on-change"}},
 	{Name: "ietf-alarms", Revision: "2019-09-11", Namespace: nsAlarms},
 	{Name: "nl6-alarm-types", Revision: "2026-10-26", Namespace: nsNl6AlarmTypes},
@@ -75,7 +75,7 @@ var netconfModules = []netconfModule{
 
 // netconfLibraryContentID identifies the schema above. It changes only
 // when netconfModules does, so bump it with any edit to that table.
-const netconfLibraryContentID = "nl6-netconf-3"
+const netconfLibraryContentID = "nl6-netconf-4"
 
 // netconfModuleNamespace returns the namespace of a served module, or "".
 func netconfModuleNamespace(name string) string {

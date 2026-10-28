@@ -70,6 +70,11 @@ type netconfSubscription struct {
 	replayFrom time.Time
 	records    chan netconfEvent
 
+	// configured is set for a configured subscription (RFC 8639 §2.5) on a
+	// Call Home session: its id is fixed by configuration, no RPC can
+	// delete it, and it does not count against the session's cap.
+	configured *netconfConfiguredState
+
 	mu      sync.Mutex // guards stopped and the listener registration
 	stopped bool
 	events  chan StateChange
@@ -214,7 +219,13 @@ func (s *netconfSession) addSubscription(sub *netconfSubscription) *netconfRPCEr
 	if s.subs == nil { // the session closed under us
 		return netconfErr("application", "operation-failed", "session is closing")
 	}
-	if len(s.subs) >= netconfMaxSubscriptionsPerSession {
+	dynamic := 0
+	for _, other := range s.subs {
+		if other.configured == nil {
+			dynamic++
+		}
+	}
+	if dynamic >= netconfMaxSubscriptionsPerSession {
 		e := netconfErr("application", "invalid-value", "a session carries at most %d subscriptions", netconfMaxSubscriptionsPerSession)
 		e.AppTag = "ietf-subscribed-notifications:insufficient-resources"
 		return e
@@ -226,7 +237,7 @@ func (s *netconfSession) addSubscription(sub *netconfSubscription) *netconfRPCEr
 			}
 		}
 	}
-	sub.id = s.srv.mgr.netconf.nextSubscriptionID.Add(1)
+	sub.id = netconfFirstDynamicSubscriptionID - 1 + s.srv.mgr.netconf.nextSubscriptionID.Add(1)
 	sub.quit = make(chan struct{})
 	s.subs[sub.id] = sub
 	s.srv.mgr.netconf.subscriptionsActive.Add(1)
@@ -306,8 +317,10 @@ func (s *netconfSession) opDeleteSubscription(op *xmlElem) netconfRPCResult {
 	id, err := strconv.ParseUint(idEl.Text, 10, 32)
 	s.subsMu.Lock()
 	sub := s.subs[uint32(id)]
-	if sub != nil && sub.rfc5277 {
-		sub = nil // RFC 5277 subscriptions have no id a client can name
+	if sub != nil && (sub.rfc5277 || sub.configured != nil) {
+		// RFC 5277 subscriptions have no id a client can name, and RFC 8639
+		// §2.4.4 leaves configured ones to configuration.
+		sub = nil
 	}
 	if err == nil && sub != nil {
 		delete(s.subs, sub.id)
@@ -363,7 +376,18 @@ func (sub *netconfSubscription) stop() {
 	if sub.state != nil {
 		sub.state.RemoveListener(sub.events)
 	}
+	if sub.configured != nil {
+		sub.configured.active.Store(false) // the receiver is connecting again
+	}
 	sub.sess.srv.mgr.netconf.subscriptionsActive.Add(-1)
+}
+
+// sent counts one notification delivered to a configured subscription's
+// receiver.
+func (sub *netconfSubscription) sent() {
+	if sub.configured != nil {
+		sub.configured.sent.Add(1)
+	}
 }
 
 // complete ends the subscription at its stop-time. RFC 8639's
@@ -468,6 +492,7 @@ func (sub *netconfSubscription) sendPushUpdate(now time.Time) error {
 		return err
 	}
 	sub.sess.srv.mgr.netconf.pushUpdates.Add(1)
+	sub.sent()
 	return nil
 }
 
@@ -621,6 +646,7 @@ func (sub *netconfSubscription) sendChanges(events []StateChange, enabled map[in
 		return err
 	}
 	sub.sess.srv.mgr.netconf.pushChangeUpdates.Add(1)
+	sub.sent()
 	return nil
 }
 
@@ -730,6 +756,7 @@ func (sub *netconfSubscription) sendEvent(ev netconfEvent) error {
 		return err
 	}
 	sub.sess.srv.mgr.netconf.eventNotifications.Add(1)
+	sub.sent()
 	return nil
 }
 

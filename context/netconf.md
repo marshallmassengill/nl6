@@ -15,6 +15,7 @@ The user-facing reference is `docs/reference/netconf.md`. This file records the 
 | `netconf_server.go` | Per-device TLS listener in the netns, session table, running lock, datastore view. |
 | `netconf_manager.go` | Subsystem config, TLS config, counters, `GET /api/v1/netconf/status`. |
 | `netconf_events.go` | The per-device `NETCONF` stream: event log and replay ring, link alarm list, `/alarms`, `/streams`, `/netconf/streams`. |
+| `netconf_callhome.go` | RFC 8071 Call Home over TLS: the per-device dial loop, and the configured subscriptions delivered on its sessions. |
 | `netconf_schema.go` | `get-schema` (RFC 6022) and `/netconf-state/schemas` over the embedded modules. |
 | `netconf_yang/` | Every library module, embedded; `SOURCES.tsv` holds provenance and digests. |
 
@@ -36,6 +37,18 @@ The subsystem is OFF by default (`-netconf-enable`). It is wired into `DeviceSim
 
 **`-fidelity` does not mute NETCONF.** A subscription is requested by the collector, like gNMI dial-in SAMPLE, which fidelity does not mute either.
 
+**Call Home reuses the listener's session path whole.** `serveTLS` is the one RFC 7589 server path; the accept loop and the Call Home loop differ only in how the connection arrived (RFC 8071 §4.1: after the connect the device is the TLS server). A second session implementation for dialled connections would drift from the first. The Call Home loop is in `srv.wg`, and stopping the device cancels its context, which closes a connection mid-handshake through `context.AfterFunc`; without that, stop waited out the 30 s hello timeout.
+
+**Dials are throttled and jittered.** `DialContextInNamespace` pins an OS thread for the connect, so concurrent dials share a fleet-wide semaphore of 64 with a 10 s timeout, as gNMI dial-out does. Each backoff wait is randomised between half and all of it, because a client restart drops every device's session at one instant.
+
+**Configured subscription ids are 1-8; dynamic ids start at 100.** RFC 8639 requires ids unique across both kinds. Configured ids follow list order, so an entry has the same id on every device and every restart. The id split is in `addSubscription`; a test fails if a dynamic id lands in the configured range.
+
+**The configured feature is claimed always.** `subscription-started` is `if-feature configured`, so yanglint rejects it without the feature. Claiming it only when the flag is set would make the library content depend on the flags, and the content-id would then have to as well.
+
+**`subscription-started` and `/subscriptions` share `policy()`**, so the announcement and the datastore cannot describe a subscription differently. Their `transport` leaf is omitted: no published module defines a NETCONF transport identity, and the leaf is not `mandatory` in the YANG.
+
+**A handshake cut short by stopping the device is not a handshake failure.** The first interop run logged "TLS handshake ... failed ... A client must present a certificate" at teardown, for a Call Home connection the device itself closed. `serveTLS` checks `srv.closed` before counting.
+
 ## Findings from the external check (`make test-interop-netconf`)
 
 Every item below passed the in-package tests and failed against libyang or libnetconf2. That is the argument for the interop target.
@@ -50,6 +63,8 @@ Every item below passed the in-package tests and failed against libyang or libne
 7. **CESNET's `notifications` module has a top-level `container notification` with a mandatory `eventTime`**, an internal struct of theirs, so no real datastore validates as "complete" with it implemented. The interop check therefore runs yanglint with `-e`, which checks only the modules whose data is present, and `TestNetconfOperationalServesEveryStateTree` asserts the presence that `-e` stops checking.
 8. **netopeer2-cli resolves what it lacks through `get-schema`.** The interop session gives it NO search path: before `get-schema` existed it needed nl6's `ietf-netconf@2011-06-01` mounted, and now it fetches that, `ietf-alarms` and `nl6-alarm-types` from the device. A failed `get-schema` would surface as an rpc-error, which the session asserts is zero.
 
+9. **libnetconf2 takes an unsolicited `subscription-started` in its stride.** netopeer2-cli `listen --tls`, with nothing subscribed yet, printed the configured subscription's announcement and then its own `establish-sub` reply. A Call Home session may therefore open with notifications.
+
 ## Mistakes that are easy to reintroduce
 
 - **`strings.Builder` in a growing slice.** `parseNetconfXML` keeps one text builder per open element. Storing them by VALUE made `append` copy a written builder, and the next write panicked. That reached a session goroutine, which nothing recovers, so one RPC with text ahead of a child element killed the whole simulator. The fuzzer found it (`FuzzNetconfRequest`, crasher kept in `testdata/fuzz`). The builders are pointers now, and `session.run` and `subscription.run` recover, so a future parser bug closes one session.
@@ -59,6 +74,8 @@ Every item below passed the in-package tests and failed against libyang or libne
 - **Admin and the derived oper are TWO engine events.** `ApplyAdminStatus` broadcasts the admin move and the oper move separately, so an admin-down produces two `push-change-update`s. That is correct; a test that expects one is wrong.
 - **`enabled` is derived from admin-status and the event carries only the new admin**, so each on-change subscription keeps the last `enabled` it reported per interface.
 - **Replay and live must be registered under one lock.** `netconfEventLog.subscribe` adds the subscription and snapshots the ring in the same critical section, so no record falls between replay and live and none is sent twice. Snapshot-then-register loses records under load.
+- **A configured subscription's receiver state lives on the server, not the session.** `netconfConfiguredState` outlives Call Home sessions; `stop` sets it back to connecting. Keeping it on the subscription would lose `sent-event-records` across a reconnect, and leave nothing to report while disconnected.
+- **`helloDone` is read by `close`, which can run on another goroutine.** A device stopping during a hello closes the session from `stopNetconfServer` while the session goroutine finishes the hello. The flag and the session-start record are set together under `endMu`, so a stop either sees the start and records the end, or ends the session before any start. The race predates Call Home; Call Home, where a stop mid-handshake is routine, is what made `-race` see it.
 - **A test that renames an interface must do it before the server starts.** The event log builds the interface view when the device's server starts; `startTestNetconfWith`'s prep hook exists for this.
 
 ## Interop test detection power
