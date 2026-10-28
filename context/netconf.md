@@ -1,4 +1,4 @@
-# NETCONF over TLS and YANG-Push: engineering record
+# NETCONF over TLS and SSH, and YANG-Push: engineering record
 
 The user-facing reference is `docs/reference/netconf.md`. This file records the decisions behind the implementation and the mistakes that are easy to reintroduce. Read it before changing `go/nl6/netconf_*.go`.
 
@@ -15,6 +15,7 @@ The user-facing reference is `docs/reference/netconf.md`. This file records the 
 | `netconf_server.go` | Per-device TLS listener in the netns, session table, running lock, datastore view. |
 | `netconf_manager.go` | Subsystem config, TLS config, counters, `GET /api/v1/netconf/status`. |
 | `netconf_events.go` | The per-device `NETCONF` stream: event log and replay ring, link alarm list, `/alarms`, `/streams`, `/netconf/streams`. |
+| `netconf_ssh.go` | RFC 6242: the SSH server configuration, the netconf subsystem handshake, and `netconfSSHConn`, the channel as a session transport. |
 | `netconf_callhome.go` | RFC 8071 Call Home over TLS: the per-device dial loop, and the configured subscriptions delivered on its sessions. |
 | `netconf_schema.go` | `get-schema` (RFC 6022) and `/netconf-state/schemas` over the embedded modules. |
 | `netconf_yang/` | Every library module, embedded; `SOURCES.tsv` holds provenance and digests. |
@@ -49,6 +50,14 @@ The subsystem is OFF by default (`-netconf-enable`). It is wired into `DeviceSim
 
 **A handshake cut short by stopping the device is not a handshake failure.** The first interop run logged "TLS handshake ... failed ... A client must present a certificate" at teardown, for a Call Home connection the device itself closed. `serveTLS` checks `srv.closed` before counting.
 
+**SSH is a transport under the same session.** `netconfSession.conn` is a `netconfConn` (read, write, close, two deadlines), and `runSession` is shared by `serveTLS` and `serveSSH`. Everything above the transport, including Call Home, configured subscriptions and the event log, needed no change for SSH.
+
+**A channel deadline closes the connection.** An `ssh.Channel` has no deadlines, and a write blocks on the client's flow-control window rather than on the socket, so the socket deadline TLS relies on cannot bound it. `netconfSSHConn` arms a timer that closes the SSH connection when a deadline passes; `TestNetconfSSHConnWriteDeadline` fills a window to prove it. Clearing the read deadline must stop its timer, or the hello's 30 s bound ends every idle session 30 s in (`TestNetconfSSHReadDeadlineDisarms`).
+
+**The NETCONF SSH listener is not the device CLI.** It refuses shell, exec and other subsystems and runs one NETCONF session per connection. It shares the CLI's credentials and host key by default only so that one login works on both; the flags separate them.
+
+**The SSH login defaults are the CLI's, and are not "settings".** `-netconf-ssh-user` and `-netconf-ssh-password` default to `simadmin`, so the refusal of SSH settings without SSH compares against those defaults, not against empty. An empty password is an explicit choice (keys only), and a configuration with neither password nor keys is refused because no login could succeed.
+
 ## Findings from the external check (`make test-interop-netconf`)
 
 Every item below passed the in-package tests and failed against libyang or libnetconf2. That is the argument for the interop target.
@@ -64,6 +73,8 @@ Every item below passed the in-package tests and failed against libyang or libne
 8. **netopeer2-cli resolves what it lacks through `get-schema`.** The interop session gives it NO search path: before `get-schema` existed it needed nl6's `ietf-netconf@2011-06-01` mounted, and now it fetches that, `ietf-alarms` and `nl6-alarm-types` from the device. A failed `get-schema` would surface as an rpc-error, which the session asserts is zero.
 
 9. **libnetconf2 takes an unsolicited `subscription-started` in its stride.** netopeer2-cli `listen --tls`, with nothing subscribed yet, printed the configured subscription's announcement and then its own `establish-sub` reply. A Call Home session may therefore open with notifications.
+
+10. **netopeer2-cli over SSH needs no terminal with key authentication.** `knownhosts --mode accept`, `auth keys add` and `auth pref password -1` / `interactive -1` keep it from prompting. Its password login reads the terminal, which is why the interop sessions use a key; password and keyboard-interactive are covered in-package with the Go SSH client.
 
 ## Mistakes that are easy to reintroduce
 

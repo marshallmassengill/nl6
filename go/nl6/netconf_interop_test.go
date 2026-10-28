@@ -7,7 +7,9 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
@@ -16,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // TestNetconfInterop is the external check. The in-package tests can only
@@ -34,7 +38,9 @@ import (
 //     that must deliver the link flap the test causes;
 //   - netopeer2-cli then listens for RFC 8071 Call Home over TLS and takes
 //     a session from a device with a configured subscription, whose
-//     subscription-started and records yanglint has validated too.
+//     subscription-started and records yanglint has validated too;
+//   - netopeer2-cli repeats the stream check over SSH (RFC 6242), logging
+//     in to the SSH listener with a key and taking an SSH Call Home session.
 //
 // Run through `make test-interop-netconf`. yanglint searches nl6's own
 // embedded modules (netconf_yang/) and nothing else, so it checks exactly
@@ -390,6 +396,118 @@ func TestNetconfInterop(t *testing.T) {
 			}
 		}
 	})
+
+	// netopeer2-cli over SSH (RFC 6242), with key authentication so the
+	// CLI needs no terminal. Both the listener and SSH Call Home.
+	sshKey, sshAuthorized := newTestSSHKey(t)
+	sshPriv, err := ssh.MarshalPrivateKey(sshKeyPrivate(t, sshKey), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	write("id_ed25519", string(pem.EncodeToMemory(sshPriv)))
+	write("id_ed25519.pub", string(sshAuthorized))
+	if err := os.Chmod(filepath.Join(work, "id_ed25519"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sshSetup := "knownhosts --mode accept\nauth keys add /w/id_ed25519.pub /w/id_ed25519\n" +
+		"auth pref password -1\nauth pref interactive -1\n"
+	sshChecks := func(t *testing.T, m *SimulatorManager, out string) {
+		t.Helper()
+		if n := m.netconf.rpcErrors.Load(); n != 0 {
+			t.Errorf("nl6 answered %d of netopeer2-cli's requests with rpc-error:\n%s", n, tail(out, 60))
+		}
+		if n := m.netconf.sshAuthFailures.Load(); n != 0 {
+			t.Errorf("%d SSH authentication failures for a key login:\n%s", n, tail(out, 60))
+		}
+		for _, want := range []string{">up</oper-status>", "<alarm-notification", "nl6-at:link-down"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("netopeer2-cli output lacks %q:\n%s", want, tail(out, 60))
+			}
+		}
+		for _, bad := range []string{"ERROR", "nc_err", "libyang["} {
+			if strings.Contains(out, bad) {
+				t.Errorf("netopeer2-cli reported %q:\n%s", bad, tail(out, 60))
+			}
+		}
+	}
+	type cliResult struct {
+		out string
+		err error
+	}
+	runCLI := func(t *testing.T, cmds string) chan cliResult {
+		done := make(chan cliResult, 1)
+		go func() {
+			out, err := docker(t, "host", "", "--entrypoint", "sh", image, "-c",
+				fmt.Sprintf("(printf '%%b' %q; sleep 8; printf 'disconnect\\nquit\\n') | netopeer2-cli", cmds))
+			done <- cliResult{out, err}
+		}()
+		return done
+	}
+	sshDevice := func(t *testing.T, cfg NetconfSubsystemConfig) (*SimulatorManager, *DeviceSimulator) {
+		cfg.SSHUser, cfg.SSHAuthorizedKeys = "netconf", sshAuthorized
+		m, d, _ := startTestNetconfWith(t, 2, cfg, func(d *DeviceSimulator) {
+			st := d.metricsCycler.ifCounters.Load().State()
+			st.SetLinkState(1, OperUp)
+			st.SetLinkState(2, OperUp)
+		})
+		return m, d
+	}
+	waitSubs := func(t *testing.T, m *SimulatorManager, n int64, done chan cliResult) {
+		deadline := time.Now().Add(25 * time.Second)
+		for m.netconf.subscriptionsActive.Load() < n {
+			if time.Now().After(deadline) {
+				r := <-done
+				t.Fatalf("netopeer2-cli never established its subscription: %v\n%s", r.err, tail(r.out, 60))
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	session := "get-data --datastore operational --filter-subtree=/w/chfilter.xml\n" +
+		"establish-sub --stream NETCONF --filter-xpath /ietf-alarms:alarm-notification\n"
+
+	t.Run("netopeer2-cli SSH", func(t *testing.T) {
+		port := freeTestPort(t)
+		m, d := sshDevice(t, NetconfSubsystemConfig{SSHEnabled: true, SSHPort: port})
+		done := runCLI(t, sshSetup+fmt.Sprintf("connect --ssh --host 127.0.0.1 --port %d --login netconf\n", port)+session)
+		waitSubs(t, m, 1, done)
+		setLink(t, d, 1, OperDown)
+		r := <-done
+		if r.err != nil {
+			t.Fatalf("netopeer2-cli: %v\n%s", r.err, tail(r.out, 60))
+		}
+		sshChecks(t, m, r.out)
+	})
+
+	t.Run("netopeer2-cli SSH Call Home", func(t *testing.T) {
+		port := freeTestPort(t)
+		done := runCLI(t, sshSetup+fmt.Sprintf("listen --ssh --timeout 30 --port %d --login netconf\n", port)+session)
+		time.Sleep(2 * time.Second) // container start
+		m, d := sshDevice(t, NetconfSubsystemConfig{CallHome: fmt.Sprintf("127.0.0.1:%d", port), CallHomeTransport: "ssh",
+			CallHomeSubscriptions: "stream"})
+		waitSubs(t, m, 2, done) // the configured one and establish-sub
+		setLink(t, d, 1, OperDown)
+		r := <-done
+		if r.err != nil {
+			t.Fatalf("netopeer2-cli: %v\n%s", r.err, tail(r.out, 60))
+		}
+		sshChecks(t, m, r.out)
+		if !strings.Contains(r.out, "<subscription-started") {
+			t.Errorf("netopeer2-cli did not receive the configured subscription-started:\n%s", tail(r.out, 60))
+		}
+	})
+}
+
+// sshKeyPrivate returns the ed25519 key behind a test signer, for writing
+// it out in OpenSSH form.
+func sshKeyPrivate(t *testing.T, s ssh.Signer) ed25519.PrivateKey {
+	t.Helper()
+	testSSHKeysMu.Lock()
+	k, ok := testSSHKeys[ssh.FingerprintSHA256(s.PublicKey())]
+	testSSHKeysMu.Unlock()
+	if !ok {
+		t.Fatal("not a newTestSSHKey signer")
+	}
+	return k
 }
 
 func tail(s string, lines int) string {

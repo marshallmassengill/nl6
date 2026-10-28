@@ -1,10 +1,11 @@
-# NETCONF over TLS and YANG-Push
+# NETCONF and YANG-Push
 
 With `-netconf-enable`, every simulated device runs a NETCONF server over TLS ([RFC 7589](https://www.rfc-editor.org/rfc/rfc7589)) on TCP port 6513.
+With `-netconf-ssh` it also serves NETCONF over SSH ([RFC 6242](https://www.rfc-editor.org/rfc/rfc6242)) on port 830.
 It serves `ietf-interfaces` ([RFC 8343](https://www.rfc-editor.org/rfc/rfc8343)) and pushes it to subscribers with YANG-Push ([RFC 8639](https://www.rfc-editor.org/rfc/rfc8639) / [RFC 8641](https://www.rfc-editor.org/rfc/rfc8641)), both periodically and on change.
 It also publishes the `NETCONF` event stream, carrying `ietf-alarms` ([RFC 8632](https://www.rfc-editor.org/rfc/rfc8632)) link alarms and [RFC 6470](https://www.rfc-editor.org/rfc/rfc6470) session events, with replay.
 That stream can be subscribed to through RFC 8639 or [RFC 5277](https://www.rfc-editor.org/rfc/rfc5277).
-With `-netconf-callhome`, every device also dials a collector with NETCONF Call Home over TLS ([RFC 8071](https://www.rfc-editor.org/rfc/rfc8071)), optionally carrying configured subscriptions.
+With `-netconf-callhome`, every device also dials a collector with NETCONF Call Home ([RFC 8071](https://www.rfc-editor.org/rfc/rfc8071)) over TLS or SSH, optionally carrying configured subscriptions.
 
 Values come from the same interface state engine and counter cycler that serve SNMP and gNMI.
 A link flap caused through the REST API or the flap scheduler therefore appears in `ifOperStatus`, in gNMI ON_CHANGE, in link traps, as a NETCONF `push-change-update`, and as an `alarm-notification`.
@@ -22,10 +23,18 @@ The subsystem is **off by default**: enabling it adds a listener to every device
 | `-netconf-tls-cert` | (shared cert) | PEM server certificate. Requires `-netconf-tls-key`. |
 | `-netconf-tls-key` | | PEM private key of `-netconf-tls-cert`. |
 | `-netconf-tls-client-ca` | (none) | PEM CA bundle that client certificates must chain to. |
-| `-netconf-callhome` | (off) | Call Home client every device dials, as `host` or `host:port`; the port defaults to 4335. See [Call Home](#call-home). |
+| `-netconf-ssh` | `false` | Also serve NETCONF over SSH on every device. See [SSH](#ssh). |
+| `-netconf-ssh-port` | `830` | TCP port of the per-device SSH listener. |
+| `-netconf-ssh-user` | `simadmin` | The one SSH login. |
+| `-netconf-ssh-password` | `simadmin` | Its password, for password and keyboard-interactive login. Empty disables both. |
+| `-netconf-ssh-authorized-keys` | (none) | OpenSSH `authorized_keys` file whose keys log in as `-netconf-ssh-user`. |
+| `-netconf-ssh-host-key` | (shared key) | SSH host key, as a PEM or OpenSSH private key. |
+| `-netconf-callhome` | (off) | Call Home client every device dials, as `host` or `host:port`. See [Call Home](#call-home). |
+| `-netconf-callhome-transport` | `tls` | `tls` (default port 4335) or `ssh` (default port 4334). |
 | `-netconf-callhome-subscriptions` | (none) | Configured subscriptions sent on each Call Home session. Requires `-netconf-callhome`. |
 
-The certificate, CA and Call Home flags require `-netconf-enable`; given without it they are refused at startup.
+Every `-netconf-*` flag requires `-netconf-enable`; given without it, it is refused at startup.
+The `-netconf-ssh-*` settings also need `-netconf-ssh` or SSH Call Home, and are refused otherwise.
 A file that cannot be read or parsed is fatal at startup rather than a failure on every device later.
 
 ## TLS
@@ -50,6 +59,18 @@ The OpenNMS connector's `ca` policy does not check host names.
 - `server_cert_fingerprint`, as `SHA256:<base64>`, the form OpenSSH prints and OpenNMS's Call Home listener logs and compares.
 
 The username RFC 7589 derives from a client certificate is not used, because nothing on the server is access-controlled.
+
+## SSH
+
+With `-netconf-ssh`, every device serves the `netconf` SSH subsystem (RFC 6242) on `-netconf-ssh-port`.
+Once the subsystem starts, the session is the one TLS carries: the same hello, operations, subscriptions and limits.
+
+- **Login.** There is one user, `-netconf-ssh-user`. It logs in with `-netconf-ssh-password` (by password or keyboard-interactive), with a key from `-netconf-ssh-authorized-keys`, or with either. The defaults are the device CLI's credentials (`simadmin` / `simadmin`). Setting the password empty disables password login, and then a key file is required. A configuration with no way to log in is refused at startup.
+- **Username.** The SSH login is the RFC 6470 `username` of the session events.
+- **Host key.** Every device presents `-netconf-ssh-host-key`, or otherwise the simulator's shared SSH host key. The shared key is also the device CLI's, and it is regenerated at every start, so a client that pins it has to re-pin after a restart. `ssh_host_key_fingerprint` in the status endpoint reports it as `SHA256:<base64>`, the form OpenSSH and OpenNMS's host-key policies use.
+- **Channels.** The listener serves NETCONF only: a shell, an `exec` or another subsystem is refused, since the device CLI has its own SSH port. One NETCONF session runs per SSH connection, and further channels on it are refused.
+- **Keepalives.** SSH keepalive requests are answered with a failure reply, which OpenSSH and Apache MINA (OpenNMS's SSH client) count as a sign of life.
+- **Counters.** The SSH and TLS listeners share the device's 16-connection cap. A failed SSH handshake is counted in `ssh_handshake_failures`; every rejected login attempt (each wrong password or key offered) is counted in `ssh_auth_failures`.
 
 ## What is served
 
@@ -266,14 +287,18 @@ A subscription's queue holds 64 records; when it is full, the oldest is dropped 
 
 ## Call Home
 
-With `-netconf-callhome`, every device dials the given client with NETCONF Call Home over TLS (RFC 8071 §4.1):
+With `-netconf-callhome`, every device dials the given client with NETCONF Call Home, over TLS (RFC 8071 §4.1, port 4335 by default) or, with `-netconf-callhome-transport ssh`, over SSH (§3.1, port 4334 by default):
 
 - The device connects from its own address, so a collector can identify it by the source of the connection.
-- Once the TCP connection is up, the roles are those of an ordinary session. The device is the TLS server and the NETCONF server: it presents its server certificate, requires the client's certificate as `-netconf-tls-client-ca` dictates, and serves every operation the listener does.
+- Once the TCP connection is up, the roles are those of an ordinary session.
+  - Over TLS, the device is the TLS server: it presents its server certificate and requires the client's certificate as `-netconf-tls-client-ca` dictates.
+  - Over SSH, the device is the SSH server: it presents its SSH host key and authenticates the client with the `-netconf-ssh-*` login.
+  - Either way it is the NETCONF server and serves every operation its listener does.
+- SSH Call Home does not need `-netconf-ssh`. Without it, the device has no SSH listener, but it still uses the SSH login and host key settings.
 - The connection is persistent. When it ends or a dial fails, the device dials again after a backoff that starts at 1 s and doubles up to 30 s. Each wait is randomised between half and all of the backoff, so a fleet whose client restarted does not redial in lockstep. A session that lasted at least 30 s resets the backoff.
 - The per-device listener keeps running alongside, on `-netconf-port`.
 
-A failed TLS handshake on a Call Home connection is counted in `tls_handshake_failures`, like one on the listener.
+A failed TLS or SSH handshake on a Call Home connection is counted in `tls_handshake_failures` or `ssh_handshake_failures`, like one on a listener.
 A handshake cut short because the device is stopping is not counted.
 
 ### Configured subscriptions
@@ -344,9 +369,18 @@ Like gNMI dial-in SAMPLE, a periodic subscription is requested by the collector,
   "callhome_connected": 100,
   "callhome_dials": 104,
   "callhome_dial_failures": 4,
-  "callhome_sessions_total": 100
+  "callhome_sessions_total": 100,
+  "callhome_transport": "tls",
+  "ssh_port": 830,
+  "ssh_user": "netconf",
+  "ssh_auth_methods": ["password", "keyboard-interactive", "publickey"],
+  "ssh_host_key_fingerprint": "SHA256:BJ0a...",
+  "ssh_handshake_failures": 0,
+  "ssh_auth_failures": 2
 }
 ```
+
+The `ssh` fields are present when the SSH listener or SSH Call Home is configured. `ssh_port` is omitted when only SSH Call Home is.
 
 The `callhome` fields are present only with `-netconf-callhome`:
 
@@ -361,6 +395,30 @@ The first failed TLS handshake and the first failed hello are logged.
 Later failures are only counted, because one misconfigured collector fails once per device per retry.
 
 ## Using it from OpenNMS
+
+### The shipped package, over SSH
+
+The connector's shipped default package, `NETCONF-Default`, connects over SSH on port 830 and authenticates with the `netconf` secure-credentials-vault entry.
+Run nl6 with the same login and the package works unchanged:
+
+```
+-netconf-enable -netconf-ssh -netconf-ssh-user <scv netconf username> -netconf-ssh-password <scv netconf password>
+```
+
+The package's default host-key policy is `known-hosts`, which rejects a key it has not seen.
+Either add the key to the known-hosts file, or set the requisition metadata `netconf.hostKeyPolicy` on the nl6 nodes:
+
+- `fingerprint`, with the value of `ssh_host_key_fingerprint`;
+- or `accept-all` in a lab.
+
+The shared host key changes at every nl6 start, so pin a `-netconf-ssh-host-key` if you use either of the first two.
+
+Its two subscription groups are on the `NETCONF` stream:
+
+- `/ietf-alarms:alarm-notification` raises and clears `link-down` alarms, through the shipped `ietf-alarms` event definitions.
+- `/ietf-netconf-notifications:netconf-config-change` never fires, because nl6 is read-only.
+
+### TLS and datastore subscriptions
 
 The OpenNMS NETCONF connector speaks RFC 7589 with `transport` set to `tls`.
 A package for a datastore subscription on nl6 devices:
@@ -385,9 +443,7 @@ The `auto` mode also picks RFC 8639: it reads `ietf-subscribed-notifications` fr
 
 - Each edit of a `push-change-update` becomes an OpenNMS event, with `target` and the changed leaf as parameters.
 - At the time of writing, the OpenNMS adapter drops periodic `push-update` notifications ("for a metrics adapter"), so on-change is the path that produces events.
-- The subscription groups of the connector's shipped default package also work against nl6, once the package is pointed at TLS: set `transport`, `port` and the certificate parameters as above, since the shipped package uses SSH. Its two groups are on the `NETCONF` stream:
-  - `/ietf-alarms:alarm-notification` raises and clears `link-down` alarms, through the shipped `ietf-alarms` event definitions.
-  - `/ietf-netconf-notifications:netconf-config-change` never fires, because nl6 is read-only.
+- The shipped package's groups work over TLS too, with `transport`, `port` and the certificate parameters set as above.
 - With the `alarms` group's default `reconcile=additive`, the connector reads `/alarms/alarm-list` after each connect and raises every alarm that is not cleared.
   Interfaces that were already down when the session started therefore become OpenNMS alarms too.
 - `replay=true` works: after a reconnect, the connector asks for what it missed, within the 256-record buffer.
@@ -396,7 +452,16 @@ The `auto` mode also picks RFC 8639: it reads `ietf-subscribed-notifications` fr
 
 ### Call Home
 
-OpenNMS's NETCONF Call Home listener accepts TLS with `transport` set to `tls`, on port 4335 by default.
+The shipped `NETCONF-CallHome` listener takes SSH Call Home on port 4334, with the login `netconf` / `changeme` and an alarm subscription of its own.
+Once you enable it, point nl6 at it with the same login:
+
+```
+-netconf-enable -netconf-callhome <opennms-host> -netconf-callhome-transport ssh -netconf-ssh-user netconf -netconf-ssh-password changeme
+```
+
+Over SSH the listener identifies the caller by its host key, whose fingerprint is `ssh_host_key_fingerprint`.
+
+OpenNMS's listener accepts TLS with `transport` set to `tls`, on port 4335 by default.
 Point nl6 at it with `-netconf-callhome <opennms-host>`.
 
 ```xml
@@ -410,7 +475,7 @@ Point nl6 at it with `-netconf-callhome <opennms-host>`.
 
 - The listener accepts a caller whose source address belongs to a node, or whose fingerprint is in `allowedFingerprints`.
   - nl6 devices dial from their own addresses, so provisioned nodes match by address.
-  - Without nodes, set `allowedFingerprints` to `server_cert_fingerprint` from the status endpoint. Every device presents the same certificate, so one value admits the fleet. The listener compares the `SHA256:<base64>` form exactly, so the colon-hex `server_cert_sha256` does not match.
+  - Without nodes, set `allowedFingerprints` to `server_cert_fingerprint` (TLS) or `ssh_host_key_fingerprint` (SSH) from the status endpoint. Every device presents the same certificate and host key, so one value admits the fleet. The listener compares the `SHA256:<base64>` form exactly, so the colon-hex `server_cert_sha256` does not match.
 - With the listener's default `acceptConfigured=true` and no `stream`, `datastore` or filter, it establishes no subscription of its own and forwards what the device's configured subscriptions send. Run nl6 with `-netconf-callhome-subscriptions` in that case, or it sends nothing.
   - Records of a configured `stream` subscription carry no subscription id, so the forwarder classifies them as event-stream notifications.
   - `subscription-started` is forwarded as an event-stream notification too.
@@ -429,10 +494,11 @@ Point nl6 at it with `-netconf-callhome <opennms-host>`.
 - In that session it runs `get-data`, then an on-change `establish-push` and an `establish-sub` on the `NETCONF` stream. Both must deliver a link flap, and no request may draw an rpc-error.
 - `netopeer2-cli listen --tls` takes a Call Home session from a device with a configured `stream` subscription. It must receive `subscription-started`, answer `get-data`, establish its own stream subscription and receive the alarm of a link flap, with no rpc-error.
 - yanglint also validates the Call Home documents: each `subscription-started`, the configured subscriptions' records, and `/subscriptions` in both datastores.
+- `netopeer2-cli connect --ssh` logs in to the SSH listener with a key, and `netopeer2-cli listen --ssh` takes an SSH Call Home session carrying a configured subscription. Each runs `get-data` and a stream subscription that must deliver a link flap's alarm, with no rpc-error and no failed login.
 
 ## Not implemented
 
-- NETCONF over SSH (RFC 6242), and Call Home over SSH.
+- More than one SSH login, per-user access control (NACM), and several NETCONF sessions on one SSH connection.
 - More than one Call Home client, or the RFC 8071 periodic connection type. The connection is persistent.
 - Event streams other than `NETCONF`, and notifications other than link alarms and session events.
 - Configured subscriptions beyond the three `-netconf-callhome-subscriptions` kinds, configuring them over NETCONF, their replay, and the subscription-state notifications other than `subscription-started`.

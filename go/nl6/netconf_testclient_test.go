@@ -13,6 +13,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"strings"
@@ -111,6 +112,7 @@ func startTestNetconfWith(t *testing.T, ifCount int, cfg NetconfSubsystemConfig,
 		deviceIPs:       map[string]struct{}{},
 		deviceTypesByIP: map[string]string{},
 		sharedTLSCert:   generateTestTLSCert(t),
+		sharedSSHSigner: testNetconfSSHSigner(t),
 	}
 	cfg.Enabled = true
 	if err := mgr.StartNetconfSubsystem(cfg); err != nil {
@@ -140,10 +142,17 @@ func startTestNetconfWith(t *testing.T, ifCount int, cfg NetconfSubsystemConfig,
 	return mgr, dev, dev.netconfServer.ln.Addr().String()
 }
 
-// ncTestClient is a minimal NETCONF client over TLS.
+// ncTestConn is the client's transport: a TLS connection, or an SSH
+// netconf channel (sshTestConn).
+type ncTestConn interface {
+	io.ReadWriteCloser
+	SetDeadline(time.Time) error
+}
+
+// ncTestClient is a minimal NETCONF client over TLS or SSH.
 type ncTestClient struct {
 	t       *testing.T
-	conn    *tls.Conn
+	conn    ncTestConn
 	rd      *netconfReader
 	chunked bool
 	hello   *xmlElem
@@ -167,7 +176,7 @@ func dialTestNetconf(t *testing.T, addr string, cert *tls.Certificate, base11 bo
 
 // helloTestNetconf runs the client side of the hello exchange on conn,
 // which may have been accepted from a device calling home.
-func helloTestNetconf(t *testing.T, conn *tls.Conn, base11 bool) (*ncTestClient, error) {
+func helloTestNetconf(t *testing.T, conn ncTestConn, base11 bool) (*ncTestClient, error) {
 	t.Helper()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	c := &ncTestClient{t: t, conn: conn, rd: newNetconfReader(conn, 16<<20)}

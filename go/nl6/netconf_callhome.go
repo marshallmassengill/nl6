@@ -18,10 +18,11 @@ import (
 	"time"
 )
 
-// NETCONF Call Home over TLS (RFC 8071 §4.1). Each device dials the
-// configured client from its own address and, once the TCP connection is
-// up, is the TLS server and the NETCONF server on it: everything after the
-// connect is the RFC 7589 path a listener-accepted connection takes. The
+// NETCONF Call Home over TLS (RFC 8071 §4.1) or SSH (§3.1). Each device
+// dials the configured client from its own address and, once the TCP
+// connection is up, is the TLS or SSH server and the NETCONF server on it:
+// everything after the connect is the path a listener-accepted connection
+// of that transport takes. The
 // connection is persistent: when it ends the device dials again, with
 // capped, jittered backoff.
 //
@@ -32,9 +33,10 @@ import (
 // disconnected are not replayed to it.
 
 const (
-	// netconfCallHomeDefaultPort is the IANA port for NETCONF Call Home
-	// over TLS (RFC 8071 §6).
-	netconfCallHomeDefaultPort = 4335
+	// netconfCallHomeDefaultPort and netconfCallHomeSSHDefaultPort are the
+	// IANA ports for NETCONF Call Home over TLS and over SSH (RFC 8071 §6).
+	netconfCallHomeDefaultPort    = 4335
+	netconfCallHomeSSHDefaultPort = 4334
 
 	netconfCallHomeInitialBackoff = time.Second
 	netconfCallHomeMaxBackoff     = 30 * time.Second
@@ -66,12 +68,13 @@ const (
 var netconfCallHomeDialSem = make(chan struct{}, netconfCallHomeMaxConcurrentDials)
 
 // netconfCallHomeAddress canonicalises -netconf-callhome: host or host:port,
-// with an IPv6 literal bracketed when it carries a port.
-func netconfCallHomeAddress(v string) (string, error) {
+// with an IPv6 literal bracketed when it carries a port, and defPort when it
+// carries none.
+func netconfCallHomeAddress(v string, defPort int) (string, error) {
 	v = strings.TrimSpace(v)
 	host, port, err := net.SplitHostPort(v)
 	if err != nil {
-		host, port = strings.TrimSuffix(strings.TrimPrefix(v, "["), "]"), strconv.Itoa(netconfCallHomeDefaultPort)
+		host, port = strings.TrimSuffix(strings.TrimPrefix(v, "["), "]"), strconv.Itoa(defPort)
 	}
 	if host == "" || strings.ContainsAny(host, " /") {
 		return "", fmt.Errorf("netconf: -netconf-callhome %q is not host or host:port", v)
@@ -328,7 +331,11 @@ func (ch *netconfCallHome) run() {
 			// progress, so stopping the device does not wait for a timeout.
 			stop := context.AfterFunc(ch.ctx, func() { _ = conn.Close() })
 			nc.callHomeConnected.Add(1)
-			if ch.srv.serveTLS(conn, true) {
+			serve := ch.srv.serveTLS
+			if nc.callHomeSSH {
+				serve = ch.srv.serveSSH // RFC 8071 §3.1: the device is the SSH server
+			}
+			if serve(conn, true) {
 				nc.callHomeSessionsTotal.Add(1)
 			}
 			nc.callHomeConnected.Add(-1)

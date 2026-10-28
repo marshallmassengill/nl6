@@ -115,11 +115,20 @@ type netconfRPCResult struct {
 
 var netconfOK = netconfRPCResult{body: "<ok/>"}
 
-// netconfSession is one NETCONF session on one TLS connection.
+// netconfConn is a session's transport: a TLS connection, or the netconf
+// subsystem channel of an SSH connection (netconfSSHConn).
+type netconfConn interface {
+	io.ReadWriteCloser
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+// netconfSession is one NETCONF session on one TLS connection or SSH
+// channel.
 type netconfSession struct {
 	id   uint32
 	srv  *netconfServer
-	conn net.Conn
+	conn netconfConn
 	rd   *netconfReader
 	// chunked is set once, during the hello exchange, before any goroutine
 	// other than the session's own can write.

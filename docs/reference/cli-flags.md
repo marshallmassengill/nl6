@@ -294,8 +294,8 @@ See [gNMI dial-in reference](gnmi.md) for path coverage, subscribe semantics, an
 
 ## NETCONF flags
 
-NETCONF over TLS (RFC 7589) with YANG-Push (RFC 8639/8641) is **off by default**.
-See [NETCONF over TLS and YANG-Push](netconf.md) for the served model, operations, subscriptions and limits.
+NETCONF over TLS (RFC 7589) and SSH (RFC 6242), with YANG-Push (RFC 8639/8641), is **off by default**.
+See [NETCONF and YANG-Push](netconf.md) for the served model, operations, subscriptions and limits.
 
 | Flag | Type | Default | Scope | Purpose |
 |------|------|---------|-------|---------|
@@ -304,10 +304,17 @@ See [NETCONF over TLS and YANG-Push](netconf.md) for the served model, operation
 | `-netconf-tls-cert` | string | `""` | **global** | PEM server certificate, with `-netconf-tls-key`. Empty presents the shared self-signed certificate, which is regenerated at every start. |
 | `-netconf-tls-key` | string | `""` | **global** | PEM private key of `-netconf-tls-cert`. |
 | `-netconf-tls-client-ca` | string | `""` | **global** | PEM CA bundle that client certificates must chain to. Empty still requires a client certificate (RFC 7589 is mutual TLS) but does not verify it. |
-| `-netconf-callhome` | string | `""` | **global** | NETCONF Call Home over TLS (RFC 8071): every device dials this `host` or `host:port` (port 4335 when omitted) from its own address and serves NETCONF on the connection, redialling when it ends. Empty is off. |
+| `-netconf-ssh` | bool | `false` | **global** | Also serve NETCONF over SSH (the `netconf` subsystem, RFC 6242) on every device. |
+| `-netconf-ssh-port` | int | `830` | **global** | TCP port of the per-device NETCONF-over-SSH listener. |
+| `-netconf-ssh-user` | string | `simadmin` | **global** | The one NETCONF-over-SSH login. |
+| `-netconf-ssh-password` | string | `simadmin` | **global** | Its password, for password and keyboard-interactive login. Empty disables both and requires `-netconf-ssh-authorized-keys`. |
+| `-netconf-ssh-authorized-keys` | string | `""` | **global** | OpenSSH `authorized_keys` file whose keys log in as `-netconf-ssh-user`. |
+| `-netconf-ssh-host-key` | string | `""` | **global** | SSH host key (PEM or OpenSSH private key). Empty presents the shared SSH host key, regenerated at every start. |
+| `-netconf-callhome` | string | `""` | **global** | NETCONF Call Home (RFC 8071): every device dials this `host` or `host:port` (port 4335 for TLS, 4334 for SSH, when omitted) from its own address and serves NETCONF on the connection, redialling when it ends. Empty is off. |
+| `-netconf-callhome-transport` | string | `tls` | **global** | Call Home transport: `tls`, or `ssh` with the `-netconf-ssh-*` login and host key. Requires `-netconf-callhome`. |
 | `-netconf-callhome-subscriptions` | string | `""` | **global** | Configured subscriptions (RFC 8639) sent on each Call Home session, comma-separated: `stream`, `on-change`, `periodic=<duration>`. Ids are 1 onwards in list order. Requires `-netconf-callhome`. |
 
-The certificate, CA and Call Home flags require `-netconf-enable`. An unreadable or unparsable file, an invalid Call Home address and an invalid subscription list are fatal at startup.
+Every `-netconf-*` flag requires `-netconf-enable`, and the `-netconf-ssh-*` settings also need `-netconf-ssh` or SSH Call Home. An unreadable or unparsable file, an invalid Call Home address or transport, an invalid subscription list and an SSH configuration nobody could log in with are fatal at startup.
 
 ## gNMI dial-out flags
 

@@ -485,8 +485,9 @@ test-interop-pyroscope: check-go check-docker
 ## netopeer2-cli runs a mutual-TLS session that must resolve what it lacks
 ## through get-schema, take an on-change push and a NETCONF-stream alarm,
 ## and draw no rpc-error, then takes a TLS Call Home session (listen --tls)
-## from a device with a configured subscription. --network host (for
-## netopeer2-cli) needs Linux.
+## from a device with a configured subscription, and repeats the stream
+## check over SSH, to the listener and by SSH Call Home. --network host
+## (for netopeer2-cli) needs Linux.
 NETCONF_INTEROP_IMAGE ?= ghcr.io/notconf/notconf:debug
 test-interop-netconf: check-go check-docker
 	docker pull -q $(NETCONF_INTEROP_IMAGE) >/dev/null

@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // netconfDefaultPort is the IANA port for NETCONF over TLS (RFC 7589 §6).
@@ -54,19 +56,44 @@ type NetconfSubsystemConfig struct {
 	// §2.5) delivered over each Call Home session, in the syntax of
 	// parseNetconfConfiguredSubscriptions. They need CallHome.
 	CallHomeSubscriptions string
+	// CallHomeTransport is "tls" (default) or "ssh". The default port of
+	// CallHome follows it: 4335 for TLS, 4334 for SSH (RFC 8071 §6).
+	CallHomeTransport string
+
+	// SSHEnabled adds an RFC 6242 listener on SSHPort (830 when zero) to
+	// every device. SSH Call Home uses the same server configuration.
+	SSHEnabled bool
+	SSHPort    int
+	// SSHUser is the one login (empty means the device CLI's, simadmin),
+	// with SSHPassword (empty disables password and keyboard-interactive
+	// authentication; the flag defaults to the CLI's) and/or a key from
+	// SSHAuthorizedKeys (OpenSSH authorized_keys format).
+	SSHUser, SSHPassword string
+	SSHAuthorizedKeys    []byte
+	// SSHHostKeyPEM is the host key. Empty means the simulator's shared SSH
+	// host key, regenerated at every start like the shared certificate.
+	SSHHostKeyPEM []byte
 }
 
 // netconfSubsystem is the manager's NETCONF state: configuration fixed at
 // start plus counters that survive device churn.
 type netconfSubsystem struct {
-	active     atomic.Bool
-	port       int
-	tlsConfig  *tls.Config
-	clientAuth string
-	certSHA256 string
-	certPrint  string // SHA256:<base64>
-	callHome   string // host:port, empty when off
-	configured []netconfConfiguredSubscription
+	active      atomic.Bool
+	port        int
+	tlsConfig   *tls.Config
+	clientAuth  string
+	certSHA256  string
+	certPrint   string // SHA256:<base64>
+	callHome    string // host:port, empty when off
+	callHomeSSH bool   // Call Home transport is SSH rather than TLS
+	configured  []netconfConfiguredSubscription
+
+	sshEnabled     bool
+	sshPort        int
+	sshConfig      *ssh.ServerConfig // nil unless the listener or SSH Call Home needs it
+	sshUser        string
+	sshAuthMethods []string
+	sshHostKeyFP   string
 
 	nextSessionID      atomic.Uint32
 	nextSubscriptionID atomic.Uint32
@@ -91,9 +118,13 @@ type netconfSubsystem struct {
 	callHomeSessionsTotal atomic.Uint64
 	callHomeConnected     atomic.Int64
 
+	sshHandshakeFailures atomic.Uint64
+	sshAuthFailures      atomic.Uint64
+
 	firstHandshakeErr sync.Once
 	firstHelloErr     sync.Once
 	firstCallHomeErr  sync.Once
+	firstSSHErr       sync.Once
 }
 
 // NetconfStatus is the body of GET /api/v1/netconf/status.
@@ -133,6 +164,16 @@ type NetconfStatus struct {
 	CallHomeDials           *uint64  `json:"callhome_dials,omitempty"`
 	CallHomeDialFailures    *uint64  `json:"callhome_dial_failures,omitempty"`
 	CallHomeSessionsTotal   *uint64  `json:"callhome_sessions_total,omitempty"`
+	CallHomeTransport       string   `json:"callhome_transport,omitempty"`
+
+	// The SSH fields are present when the SSH listener or SSH Call Home is
+	// configured.
+	SSHPort               int      `json:"ssh_port,omitempty"`
+	SSHUser               string   `json:"ssh_user,omitempty"`
+	SSHAuthMethods        []string `json:"ssh_auth_methods,omitempty"`
+	SSHHostKeyFingerprint string   `json:"ssh_host_key_fingerprint,omitempty"`
+	SSHHandshakeFailures  *uint64  `json:"ssh_handshake_failures,omitempty"`
+	SSHAuthFailures       *uint64  `json:"ssh_auth_failures,omitempty"`
 }
 
 // StartNetconfSubsystem validates cfg and records it. With Enabled false it
@@ -185,8 +226,22 @@ func (sm *SimulatorManager) StartNetconfSubsystem(cfg NetconfSubsystemConfig) er
 	if cfg.CallHome == "" && cfg.CallHomeSubscriptions != "" {
 		return fmt.Errorf("netconf: -netconf-callhome-subscriptions needs -netconf-callhome: configured subscriptions are delivered over Call Home")
 	}
+	switch cfg.CallHomeTransport {
+	case "", "tls":
+	case "ssh":
+		nc.callHomeSSH = true
+	default:
+		return fmt.Errorf("netconf: -netconf-callhome-transport %q is not tls or ssh", cfg.CallHomeTransport)
+	}
+	if cfg.CallHome == "" && cfg.CallHomeTransport != "" {
+		return fmt.Errorf("netconf: -netconf-callhome-transport needs -netconf-callhome")
+	}
 	if cfg.CallHome != "" {
-		ch, err := netconfCallHomeAddress(cfg.CallHome)
+		defPort := netconfCallHomeDefaultPort
+		if nc.callHomeSSH {
+			defPort = netconfCallHomeSSHDefaultPort
+		}
+		ch, err := netconfCallHomeAddress(cfg.CallHome, defPort)
 		if err != nil {
 			return err
 		}
@@ -195,6 +250,9 @@ func (sm *SimulatorManager) StartNetconfSubsystem(cfg NetconfSubsystemConfig) er
 			return err
 		}
 		nc.callHome, nc.configured = ch, subs
+	}
+	if err := nc.configureSSH(cfg, sm.sharedSSHSigner); err != nil {
+		return err
 	}
 	nc.tlsConfig = tc
 	nc.port = port
@@ -215,10 +273,78 @@ func (sm *SimulatorManager) StartNetconfSubsystem(cfg NetconfSubsystemConfig) er
 		log.Printf("NETCONF subsystem enabled on port %d (TLS, RFC 7589); client certificates verified against "+
 			"-netconf-tls-client-ca. Server certificate SHA-256 %s", port, nc.certSHA256)
 	}
-	if nc.callHome != "" {
-		log.Printf("NETCONF Call Home over TLS (RFC 8071) to %s from every device, %d configured subscription(s)",
-			nc.callHome, len(nc.configured))
+	if nc.sshEnabled {
+		log.Printf("NETCONF over SSH (RFC 6242) on port %d; login %q by %s. Host key %s", nc.sshPort, nc.sshUser,
+			strings.Join(nc.sshAuthMethods, ", "), nc.sshHostKeyFP)
 	}
+	if nc.callHome != "" {
+		transport := "TLS"
+		if nc.callHomeSSH {
+			transport = "SSH"
+		}
+		log.Printf("NETCONF Call Home over %s (RFC 8071) to %s from every device, %d configured subscription(s)",
+			transport, nc.callHome, len(nc.configured))
+	}
+	return nil
+}
+
+// configureSSH validates the SSH settings and builds the server
+// configuration when the listener or SSH Call Home needs one. Settings
+// given while neither does are refused, not ignored.
+func (nc *netconfSubsystem) configureSSH(cfg NetconfSubsystemConfig, shared ssh.Signer) error {
+	needed := cfg.SSHEnabled || nc.callHomeSSH
+	if !needed {
+		if cfg.SSHPort != 0 || len(cfg.SSHAuthorizedKeys) > 0 || len(cfg.SSHHostKeyPEM) > 0 ||
+			(cfg.SSHPassword != "" && cfg.SSHPassword != PASSWORD) || (cfg.SSHUser != "" && cfg.SSHUser != USERNAME) {
+			return fmt.Errorf("netconf: the -netconf-ssh-* settings need -netconf-ssh or -netconf-callhome-transport ssh")
+		}
+		return nil
+	}
+	port := cfg.SSHPort
+	if port == 0 {
+		port = netconfSSHDefaultPort
+	}
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("netconf: invalid -netconf-ssh-port %d (must be 1..65535)", port)
+	}
+	auth := &netconfSSHAuth{user: cfg.SSHUser, password: cfg.SSHPassword}
+	if auth.user == "" {
+		auth.user = USERNAME
+	}
+	if len(cfg.SSHAuthorizedKeys) > 0 {
+		keys, err := parseNetconfAuthorizedKeys(cfg.SSHAuthorizedKeys)
+		if err != nil {
+			return err
+		}
+		auth.keys = keys
+	}
+	if auth.password == "" && len(auth.keys) == 0 {
+		return fmt.Errorf("netconf: SSH needs -netconf-ssh-password or -netconf-ssh-authorized-keys: no login would succeed")
+	}
+	signer := shared
+	if len(cfg.SSHHostKeyPEM) > 0 {
+		s, err := ssh.ParsePrivateKey(cfg.SSHHostKeyPEM)
+		if err != nil {
+			return fmt.Errorf("netconf: -netconf-ssh-host-key: %v", err)
+		}
+		signer = s
+	}
+	if signer == nil {
+		return fmt.Errorf("netconf: no SSH host key (the shared key was not generated and none was given)")
+	}
+	nc.sshEnabled, nc.sshPort, nc.sshUser = cfg.SSHEnabled, port, auth.user
+	if !cfg.SSHEnabled {
+		nc.sshPort = 0
+	}
+	nc.sshAuthMethods = nil
+	if auth.password != "" {
+		nc.sshAuthMethods = append(nc.sshAuthMethods, "password", "keyboard-interactive")
+	}
+	if len(auth.keys) > 0 {
+		nc.sshAuthMethods = append(nc.sshAuthMethods, "publickey")
+	}
+	nc.sshHostKeyFP = ssh.FingerprintSHA256(signer.PublicKey())
+	nc.sshConfig = netconfSSHConfig(signer, auth, func() { nc.sshAuthFailures.Add(1) })
 	return nil
 }
 
@@ -247,6 +373,14 @@ func (nc *netconfSubsystem) logFirstHandshakeError(d *DeviceSimulator, remote ne
 	nc.firstHandshakeErr.Do(func() {
 		log.Printf("netconf: TLS handshake from %v to device %s failed: %v (further failures are counted in "+
 			"GET /api/v1/netconf/status tls_handshake_failures, not logged). A client must present a certificate (RFC 7589)",
+			remote, d.IP, err)
+	})
+}
+
+func (nc *netconfSubsystem) logFirstSSHError(d *DeviceSimulator, remote net.Addr, err error) {
+	nc.firstSSHErr.Do(func() {
+		log.Printf("netconf: SSH handshake from %v to device %s failed: %v (further failures are counted in "+
+			"GET /api/v1/netconf/status ssh_handshake_failures, not logged; failed logins also in ssh_auth_failures)",
 			remote, d.IP, err)
 	})
 }
@@ -293,6 +427,15 @@ func (sm *SimulatorManager) GetNetconfStatus() NetconfStatus {
 		connected, dials, failures, total := nc.callHomeConnected.Load(), nc.callHomeDials.Load(),
 			nc.callHomeDialFailures.Load(), nc.callHomeSessionsTotal.Load()
 		st.CallHomeConnected, st.CallHomeDials, st.CallHomeDialFailures, st.CallHomeSessionsTotal = &connected, &dials, &failures, &total
+		st.CallHomeTransport = "tls"
+		if nc.callHomeSSH {
+			st.CallHomeTransport = "ssh"
+		}
+	}
+	if nc.sshConfig != nil {
+		st.SSHPort, st.SSHUser, st.SSHAuthMethods, st.SSHHostKeyFingerprint = nc.sshPort, nc.sshUser, nc.sshAuthMethods, nc.sshHostKeyFP
+		hs, af := nc.sshHandshakeFailures.Load(), nc.sshAuthFailures.Load()
+		st.SSHHandshakeFailures, st.SSHAuthFailures = &hs, &af
 	}
 	sm.mu.RLock()
 	for _, d := range sm.devices {

@@ -31,7 +31,9 @@ type netconfServer struct {
 	dev *DeviceSimulator
 	mgr *SimulatorManager
 	ln  net.Listener
-	wg  sync.WaitGroup
+	// sshLn is the RFC 6242 listener, nil unless -netconf-ssh.
+	sshLn net.Listener
+	wg    sync.WaitGroup
 
 	mu        sync.Mutex
 	sessions  map[uint32]*netconfSession
@@ -60,6 +62,34 @@ func (d *DeviceSimulator) startNetconfServer(port int) error {
 	if mgr == nil {
 		return fmt.Errorf("simulator manager not initialised")
 	}
+	ln, err := d.listenNetconf(port)
+	if err != nil {
+		return err
+	}
+	srv := &netconfServer{dev: d, mgr: mgr, ln: ln, sessions: map[uint32]*netconfSession{}}
+	if mgr.netconf.sshEnabled {
+		if srv.sshLn, err = d.listenNetconf(mgr.netconf.sshPort); err != nil {
+			_ = ln.Close()
+			return err
+		}
+	}
+	srv.events = newNetconfEventLog(srv)
+	d.netconfServer = srv
+	srv.wg.Add(1)
+	go srv.acceptLoop(srv.ln, srv.serveTLS)
+	if srv.sshLn != nil {
+		srv.wg.Add(1)
+		go srv.acceptLoop(srv.sshLn, srv.serveSSH)
+	}
+	if mgr.netconf.callHome != "" {
+		srv.startCallHome(mgr.netconf.callHome)
+	}
+	return nil
+}
+
+// listenNetconf binds one of the device's NETCONF listeners, inside its
+// netns when it has one.
+func (d *DeviceSimulator) listenNetconf(port int) (net.Listener, error) {
 	addr := net.JoinHostPort(d.IP.String(), fmt.Sprint(port))
 	var ln net.Listener
 	var err error
@@ -70,17 +100,9 @@ func (d *DeviceSimulator) startNetconfServer(port int) error {
 		ln, err = lc.Listen(context.Background(), "tcp", addr)
 	}
 	if err != nil {
-		return fmt.Errorf("failed to start NETCONF server on %s: %v", addr, err)
+		return nil, fmt.Errorf("failed to start NETCONF server on %s: %v", addr, err)
 	}
-	srv := &netconfServer{dev: d, mgr: mgr, ln: ln, sessions: map[uint32]*netconfSession{}}
-	srv.events = newNetconfEventLog(srv)
-	d.netconfServer = srv
-	srv.wg.Add(1)
-	go srv.acceptLoop()
-	if mgr.netconf.callHome != "" {
-		srv.startCallHome(mgr.netconf.callHome)
-	}
-	return nil
+	return ln, nil
 }
 
 // stopNetconfServer closes the listener and every session. Idempotent;
@@ -100,6 +122,9 @@ func (d *DeviceSimulator) stopNetconfServer() {
 	}
 	srv.mu.Unlock()
 	_ = srv.ln.Close()
+	if srv.sshLn != nil {
+		_ = srv.sshLn.Close()
+	}
 	if srv.callHome != nil {
 		srv.callHome.cancel() // ends a dial, a backoff wait or a handshake in progress
 	}
@@ -118,11 +143,13 @@ func (d *DeviceSimulator) stopNetconfServer() {
 	srv.events.close()
 }
 
-func (srv *netconfServer) acceptLoop() {
+// acceptLoop serves one listener. The TLS and SSH listeners share the
+// device's connection cap, which bounds the device, not a transport.
+func (srv *netconfServer) acceptLoop(ln net.Listener, serve func(net.Conn, bool) bool) {
 	defer srv.wg.Done()
 	nc := &srv.mgr.netconf
 	for {
-		conn, err := srv.ln.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -140,16 +167,12 @@ func (srv *netconfServer) acceptLoop() {
 			continue
 		}
 		srv.wg.Add(1)
-		go srv.serveConn(conn)
+		go func() {
+			defer srv.wg.Done()
+			defer srv.conns.Add(-1)
+			serve(conn, false)
+		}()
 	}
-}
-
-// serveConn runs an accepted connection: the TLS handshake, then the
-// session.
-func (srv *netconfServer) serveConn(raw net.Conn) {
-	defer srv.wg.Done()
-	defer srv.conns.Add(-1)
-	srv.serveTLS(raw, false)
 }
 
 // serveTLS is the server side of RFC 7589 on raw, which the device either
@@ -171,6 +194,17 @@ func (srv *netconfServer) serveTLS(raw net.Conn, callHome bool) bool {
 		return false
 	}
 	_ = conn.SetDeadline(time.Time{})
+	user := ""
+	if cs := conn.ConnectionState(); len(cs.PeerCertificates) > 0 {
+		user = cs.PeerCertificates[0].Subject.CommonName
+	}
+	return srv.runSession(conn, raw.RemoteAddr(), user, callHome)
+}
+
+// runSession registers a session on an established transport and serves
+// it until it ends. It reports whether the session ran.
+func (srv *netconfServer) runSession(conn netconfConn, remote net.Addr, user string, callHome bool) bool {
+	nc := &srv.mgr.netconf
 	s := &netconfSession{
 		id:       nc.nextSessionID.Add(1),
 		srv:      srv,
@@ -179,14 +213,12 @@ func (srv *netconfServer) serveTLS(raw net.Conn, callHome bool) bool {
 		subs:     map[uint32]*netconfSubscription{},
 		done:     make(chan struct{}),
 		callHome: callHome,
-	}
-	if cs := conn.ConnectionState(); len(cs.PeerCertificates) > 0 {
-		s.user = cs.PeerCertificates[0].Subject.CommonName
+		user:     user,
 	}
 	if s.user == "" {
 		s.user = "unknown" // RFC 6470 username is mandatory
 	}
-	if host, _, err := net.SplitHostPort(raw.RemoteAddr().String()); err == nil {
+	if host, _, err := net.SplitHostPort(remote.String()); err == nil {
 		s.source = host
 	}
 	srv.mu.Lock()

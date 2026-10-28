@@ -83,13 +83,13 @@ func TestNetconfCallHomeAddress(t *testing.T) {
 		{"[::1]", "[::1]:4335"},
 		{"[::1]:9000", "[::1]:9000"},
 	} {
-		got, err := netconfCallHomeAddress(tc.in)
+		got, err := netconfCallHomeAddress(tc.in, netconfCallHomeDefaultPort)
 		if err != nil || got != tc.want {
 			t.Errorf("%q: got %q, %v; want %q", tc.in, got, err, tc.want)
 		}
 	}
 	for _, bad := range []string{"", ":4335", "host:0", "host:65536", "host:port", "a b:1", "http://x"} {
-		if got, err := netconfCallHomeAddress(bad); err == nil {
+		if got, err := netconfCallHomeAddress(bad, netconfCallHomeDefaultPort); err == nil {
 			t.Errorf("%q accepted as %q", bad, got)
 		}
 	}
@@ -436,7 +436,7 @@ func TestNetconfStatusFingerprintsAreThePresentedCertificate(t *testing.T) {
 	pki := newTestPKI(t, "collector")
 	mgr, _, addr := startTestNetconf(t, 1, NetconfSubsystemConfig{})
 	c := mustDialTestNetconf(t, addr, &pki.client)
-	sum := sha256.Sum256(c.conn.ConnectionState().PeerCertificates[0].Raw)
+	sum := sha256.Sum256(c.conn.(*tls.Conn).ConnectionState().PeerCertificates[0].Raw)
 	st := mgr.GetNetconfStatus()
 	if want := "SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]); st.ServerCertFingerprint != want {
 		t.Errorf("server_cert_fingerprint %q, want %q", st.ServerCertFingerprint, want)

@@ -173,6 +173,13 @@ func main() {
 		netconfTLSKey      = flag.String("netconf-tls-key", "", "[global] PEM private key for -netconf-tls-cert")
 		netconfTLSClientCA = flag.String("netconf-tls-client-ca", "", "[global] PEM CA bundle that client certificates must chain to. Empty = a client certificate is still required (RFC 7589) but not verified")
 		netconfCallHome    = flag.String("netconf-callhome", "", "[global] NETCONF Call Home over TLS (RFC 8071): every device dials this host[:port] (default port 4335) from its own address and serves NETCONF on the connection, redialling when it ends. Empty = off")
+		netconfCallHomeTr  = flag.String("netconf-callhome-transport", "", "[global] Call Home transport: tls (default; port 4335) or ssh (RFC 8071 §3.1; port 4334, with the -netconf-ssh-* login and host key). Requires -netconf-callhome")
+		netconfSSH         = flag.Bool("netconf-ssh", false, "[global] Also serve NETCONF over SSH (RFC 6242, the netconf subsystem) on every device, on -netconf-ssh-port. Requires -netconf-enable. Default: false")
+		netconfSSHPort     = flag.Int("netconf-ssh-port", 0, "[global] TCP port of the per-device NETCONF-over-SSH listener (default: 830)")
+		netconfSSHUser     = flag.String("netconf-ssh-user", USERNAME, "[global] NETCONF-over-SSH login user (default: the device CLI's)")
+		netconfSSHPassword = flag.String("netconf-ssh-password", PASSWORD, "[global] NETCONF-over-SSH password, for password and keyboard-interactive login (default: the device CLI's). Empty disables both, which needs -netconf-ssh-authorized-keys")
+		netconfSSHKeys     = flag.String("netconf-ssh-authorized-keys", "", "[global] OpenSSH authorized_keys file whose keys log in as -netconf-ssh-user")
+		netconfSSHHostKey  = flag.String("netconf-ssh-host-key", "", "[global] SSH host key (PEM or OpenSSH private key) for NETCONF. Empty = the shared SSH host key, regenerated at every start")
 		netconfCallHomeSub = flag.String("netconf-callhome-subscriptions", "", "[global] Configured subscriptions (RFC 8639) sent on each Call Home session, comma-separated: stream (the NETCONF event stream), on-change, periodic=<duration> (both /ietf-interfaces:interfaces). Ids are 1.. in list order. Requires -netconf-callhome")
 		gnmiTLS            = flag.Bool("gnmi-tls", true, "Serve gNMI dial-in over TLS with the simulator's shared self-signed cert (default: true; clients need --skip-verify). -gnmi-tls=false serves plaintext gRPC instead, for clients that dial without TLS")
 
@@ -616,11 +623,16 @@ func main() {
 	// created from here on binds its listener. A bad certificate or CA file
 	// is fatal here rather than a per-device failure later.
 	netconfCfg := NetconfSubsystemConfig{Enabled: *netconfEnable, Port: *netconfPort,
-		CallHome: *netconfCallHome, CallHomeSubscriptions: *netconfCallHomeSub}
-	if !*netconfEnable && (*netconfTLSCert != "" || *netconfTLSKey != "" || *netconfTLSClientCA != "" ||
-		*netconfCallHome != "" || *netconfCallHomeSub != "") {
-		log.Fatalf("netconf: -netconf-tls-cert / -netconf-tls-key / -netconf-tls-client-ca / -netconf-callhome / " +
-			"-netconf-callhome-subscriptions require -netconf-enable")
+		CallHome: *netconfCallHome, CallHomeSubscriptions: *netconfCallHomeSub, CallHomeTransport: *netconfCallHomeTr,
+		SSHEnabled: *netconfSSH, SSHPort: *netconfSSHPort, SSHUser: *netconfSSHUser, SSHPassword: *netconfSSHPassword}
+	netconfFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if strings.HasPrefix(f.Name, "netconf-") && f.Name != "netconf-enable" {
+			netconfFlagSet = true
+		}
+	})
+	if !*netconfEnable && netconfFlagSet {
+		log.Fatalf("netconf: the -netconf-* flags require -netconf-enable")
 	}
 	for _, f := range []struct {
 		path string
@@ -630,6 +642,8 @@ func main() {
 		{*netconfTLSCert, &netconfCfg.CertPEM, "-netconf-tls-cert"},
 		{*netconfTLSKey, &netconfCfg.KeyPEM, "-netconf-tls-key"},
 		{*netconfTLSClientCA, &netconfCfg.ClientCAPEM, "-netconf-tls-client-ca"},
+		{*netconfSSHKeys, &netconfCfg.SSHAuthorizedKeys, "-netconf-ssh-authorized-keys"},
+		{*netconfSSHHostKey, &netconfCfg.SSHHostKeyPEM, "-netconf-ssh-host-key"},
 	} {
 		if f.path == "" {
 			continue
